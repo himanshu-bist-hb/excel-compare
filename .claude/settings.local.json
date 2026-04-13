@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import streamlit, pandas, openpyxl, numpy; print\\('All imports OK'\\)\")",
+      "Bash(python -m pip install streamlit pandas openpyxl numpy xlrd)",
+      "Bash(python -c \"import streamlit; print\\('streamlit', streamlit.__version__\\)\")",
+      "Bash(python -c \"import pandas; print\\('pandas', pandas.__version__\\)\")",
+      "Bash(python -c \"import openpyxl; print\\('openpyxl', openpyxl.__version__\\)\")",
+      "Bash(where python:*)",
+      "Bash(C:\\\\ananconda\\\\python.exe:*)",
+      "Bash(/c/ananconda/python.exe:*)",
+      "Bash(\"/c/Users/Himanshu Bist/AppData/Local/Programs/Python/Python311/python.exe\" -c \"import streamlit; print\\('st ok'\\)\")",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(\"/c/Users/Himanshu Bist/AppData/Local/Programs/Python/Python311/python.exe\" -m venv venv)",
+      "Bash(venv/Scripts/python.exe -m pip install streamlit pandas openpyxl numpy xlrd)",
+      "Bash(venv/Scripts/python -c \"import streamlit, pandas, openpyxl, numpy, xlrd; print\\('All deps OK'\\)\")",
+      "Bash(venv/Scripts/python -c ':*)",
+      "Bash(venv/Scripts/python -m streamlit run app.py --server.headless true --server.port 8501)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501/)",
+      "Bash(curl -s http://localhost:8501/)"
+    ]
+  }
+}
