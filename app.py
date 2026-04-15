@@ -938,8 +938,11 @@ def build_sidebyside_excel(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # InlineFont styles reused across all inline-diff cells
-_IF_STRIKE = InlineFont(strike=True, color="C00000")   # old value — red strikethrough
-_IF_NORMAL = InlineFont()                               # new / unchanged value
+# 8-char ARGB required — first two chars are alpha; "00" = transparent, "FF" = opaque.
+# "C00000" alone was being stored as "00C00000" (invisible). Use "FFC00000" for
+# fully-opaque dark red strikethrough.
+_IF_STRIKE = InlineFont(strike=True, color="FFC00000", rFont="Segoe UI", sz=10)
+_IF_NORMAL = InlineFont(rFont="Segoe UI", sz=10)
 
 
 def _rich_changed(old_val: str, new_val: str):
@@ -1001,11 +1004,9 @@ def build_inline_excel(
     def _finalise_inline(ws, src_wb, src_name):
         _auto_width(ws)
         ws.sheet_view.showGridLines = False
+        # Preserve the source file's print settings exactly (orientation,
+        # margins, headers, footers) — do NOT force landscape here.
         _copy_print_settings(ws, src_wb, src_name)
-        ws.page_setup.orientation = "landscape"
-        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
-        ws.page_setup.fitToWidth  = 1
-        ws.page_setup.fitToHeight = 0
 
     for name in all_names:
         ws = wb.create_sheet(title=name[:31])
@@ -1166,6 +1167,24 @@ with up_col2:
         help="The file you are comparing TO",
     )
 
+# ── Export format selector ───────────────────────────────────────────────────
+st.markdown(
+    '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.8rem 0 0.3rem">'
+    '🔧 Additional export format</p>',
+    unsafe_allow_html=True,
+)
+st.radio(
+    "export_format_selector",
+    options=["Side-by-Side", "Inline Diff"],
+    horizontal=True,
+    label_visibility="collapsed",
+    key="export_fmt",
+    help=(
+        "Side-by-Side: OLD table on the left, NEW table on the right in each sheet.\n"
+        "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
+    ),
+)
+
 # ── Instructions (shown only while files are missing) ────────────────────────
 if not old_file or not new_file:
     st.markdown(
@@ -1244,7 +1263,8 @@ modified_count = sum(
 # Auto-generate the highlighted Excel report (once per file pair)
 # ─────────────────────────────────────────────────────────────────────────────
 
-current_ids = (id(old_raw), id(new_raw))
+_fmt = st.session_state.get("export_fmt", "Side-by-Side")
+current_ids = (id(old_raw), id(new_raw), _fmt)
 if st.session_state.last_file_ids != current_ids:
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     with st.spinner("Building highlighted Excel report…"):
@@ -1253,20 +1273,26 @@ if st.session_state.last_file_ids != current_ids:
             sheet_stats, old_file.name, new_file.name,
         )
         st.session_state.report_filename = f"excel_diff_{ts}.xlsx"
-    with st.spinner("Building side-by-side comparison Excel…"):
-        st.session_state.sbs_report_bytes = build_sidebyside_excel(
-            old_sheets, new_sheets, new_only, deleted_only,
-            sheet_stats, sheet_data, old_file.name, new_file.name,
-            old_raw, new_raw,
-        )
-        st.session_state.sbs_report_filename = f"excel_diff_sidebyside_{ts}.xlsx"
-    with st.spinner("Building inline diff Excel…"):
-        st.session_state.inline_report_bytes = build_inline_excel(
-            old_sheets, new_sheets, new_only, deleted_only,
-            sheet_stats, sheet_data, old_file.name, new_file.name,
-            old_raw, new_raw,
-        )
-        st.session_state.inline_report_filename = f"excel_diff_inline_{ts}.xlsx"
+    if _fmt == "Side-by-Side":
+        with st.spinner("Building side-by-side comparison Excel…"):
+            st.session_state.sbs_report_bytes = build_sidebyside_excel(
+                old_sheets, new_sheets, new_only, deleted_only,
+                sheet_stats, sheet_data, old_file.name, new_file.name,
+                old_raw, new_raw,
+            )
+            st.session_state.sbs_report_filename = f"excel_diff_sidebyside_{ts}.xlsx"
+        st.session_state.inline_report_bytes    = None
+        st.session_state.inline_report_filename = None
+    else:
+        with st.spinner("Building inline diff Excel…"):
+            st.session_state.inline_report_bytes = build_inline_excel(
+                old_sheets, new_sheets, new_only, deleted_only,
+                sheet_stats, sheet_data, old_file.name, new_file.name,
+                old_raw, new_raw,
+            )
+            st.session_state.inline_report_filename = f"excel_diff_inline_{ts}.xlsx"
+        st.session_state.sbs_report_bytes    = None
+        st.session_state.sbs_report_filename = None
     st.session_state.last_file_ids = current_ids
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1503,9 +1529,8 @@ with exp_col2:
         help="One row per sheet — quick overview of all changes",
     )
 
-dl_col1, dl_col2 = st.columns(2)
-
-with dl_col1:
+_active_fmt = st.session_state.get("export_fmt", "Side-by-Side")
+if _active_fmt == "Side-by-Side":
     st.download_button(
         label="📋 Download Side-by-Side Comparison Excel",
         data=st.session_state.sbs_report_bytes,
@@ -1518,8 +1543,7 @@ with dl_col1:
             "red tab = deleted sheet, green tab = new sheet. Sheets sorted A→Z."
         ),
     )
-
-with dl_col2:
+else:
     st.download_button(
         label="🔀 Download Inline Diff Excel",
         data=st.session_state.inline_report_bytes,
@@ -1527,8 +1551,9 @@ with dl_col2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         help=(
-            "Single table per sheet — changed cells show ~~old~~  new in one cell, "
-            "deleted rows are struck through, added rows are green, "
-            "deleted sheets show all values struck through, new sheets have green fill."
+            "Single table per sheet — changed cells show ~~old~~  new in one cell "
+            "(old value in red with strikethrough, new value normal beside it). "
+            "Deleted rows struck through, added rows green, deleted sheets all struck through, "
+            "new sheets green fill. Print settings match the source file exactly."
         ),
     )
