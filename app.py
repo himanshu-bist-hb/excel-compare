@@ -978,6 +978,83 @@ def _replace_cell_rich(xml_text: str, ref: str, old_val: str, new_val: str) -> s
     return re.sub(pat, _sub, xml_text, flags=re.DOTALL)
 
 
+def _copy_cell_style(src_cell, dst_cell) -> None:
+    """
+    Copy all visual formatting from *src_cell* (a source workbook cell) to
+    *dst_cell* (an output workbook cell): font, alignment, fill, border,
+    and number format.  Skips gracefully if src_cell is None or any attribute
+    is unavailable.
+    """
+    if src_cell is None:
+        return
+    try:
+        if src_cell.font is not None:
+            dst_cell.font = copy.copy(src_cell.font)
+    except Exception:
+        pass
+    try:
+        if src_cell.alignment is not None:
+            dst_cell.alignment = copy.copy(src_cell.alignment)
+    except Exception:
+        pass
+    try:
+        # Only copy fill when there actually is one (fill_type=None means "no fill")
+        if src_cell.fill is not None and src_cell.fill.fill_type not in (None, "none"):
+            dst_cell.fill = copy.copy(src_cell.fill)
+    except Exception:
+        pass
+    try:
+        if src_cell.border is not None:
+            dst_cell.border = copy.copy(src_cell.border)
+    except Exception:
+        pass
+    try:
+        if src_cell.number_format and src_cell.number_format != "General":
+            dst_cell.number_format = src_cell.number_format
+    except Exception:
+        pass
+
+
+def _font_with_strike(src_font) -> Font:
+    """
+    Return a new Font that carries all properties of *src_font* but adds
+    strike=True and dark-red colour — used for deleted rows/sheets in inline diff.
+    Falls back to the global _FONT_STRIKE if src_font is None.
+    """
+    if src_font is None:
+        return _FONT_STRIKE
+    try:
+        return Font(
+            name=src_font.name,
+            size=src_font.size,
+            bold=src_font.bold,
+            italic=src_font.italic,
+            underline=src_font.underline,
+            strike=True,
+            color="C00000",
+            vertAlign=src_font.vertAlign,
+            charset=src_font.charset,
+            scheme=src_font.scheme,
+        )
+    except Exception:
+        return _FONT_STRIKE
+
+
+def _copy_row_col_dims(src_ws, dst_ws) -> None:
+    """Copy row heights and column widths from *src_ws* to *dst_ws*."""
+    if src_ws is None:
+        return
+    try:
+        for row_idx, rd in src_ws.row_dimensions.items():
+            if rd.height is not None:
+                dst_ws.row_dimensions[row_idx].height = rd.height
+        for col_letter, cd in src_ws.column_dimensions.items():
+            if cd.width is not None:
+                dst_ws.column_dimensions[col_letter].width = cd.width
+    except Exception:
+        pass
+
+
 def _patch_inline_rich_cells(
     wb_bytes: bytes,
     wb_obj: openpyxl.Workbook,
@@ -1063,8 +1140,21 @@ def build_inline_excel(
     # { sheet_name: { "A1": (old_val, new_val), ... } }
     rich_cells: Dict[str, Dict[str, tuple]] = {}
 
-    def _finalise_inline(ws, src_wb, src_name):
-        _auto_width(ws)
+    def _get_src_ws(wb_obj, sheet_name):
+        """Return the source worksheet object, or None if unavailable."""
+        if wb_obj is None:
+            return None
+        try:
+            return wb_obj[sheet_name] if sheet_name in wb_obj.sheetnames else None
+        except Exception:
+            return None
+
+    def _finalise_inline(ws, src_wb, src_name, src_ws=None):
+        # Use source row/column dimensions when available; fall back to auto-width
+        if src_ws is not None:
+            _copy_row_col_dims(src_ws, ws)
+        else:
+            _auto_width(ws)
         ws.sheet_view.showGridLines = False
         # Preserve the source file's print settings exactly (orientation,
         # margins, headers, footers) — do NOT force landscape here.
@@ -1079,14 +1169,16 @@ def build_inline_excel(
             df = new_sheets.get(name, pd.DataFrame())
             if df.empty:
                 continue
-            for i, row_vals in enumerate(
-                dataframe_to_rows(df, index=False, header=False), start=1
-            ):
-                for j, val in enumerate(row_vals, start=1):
-                    c = ws.cell(i, j, None if val == "" else val)
-                    c.fill = _FILL_ADDED
-                    c.font = _FONT_NORMAL
-            _finalise_inline(ws, new_src_wb, name)
+            src_ws = _get_src_ws(new_src_wb, name)
+            nr, nc = len(df), len(df.columns)
+            for i in range(nr):
+                for j in range(nc):
+                    val = cell_str(df.iat[i, j])
+                    c   = ws.cell(i + 1, j + 1, None if val == "" else val)
+                    # Copy all source formatting first, then override fill
+                    _copy_cell_style(src_ws.cell(i + 1, j + 1) if src_ws else None, c)
+                    c.fill = _FILL_ADDED   # green overlay marks it as a new sheet
+            _finalise_inline(ws, new_src_wb, name, src_ws)
 
         # ── Deleted sheet ─────────────────────────────────────────────────
         elif name in deleted_only:
@@ -1094,13 +1186,17 @@ def build_inline_excel(
             df = old_sheets.get(name, pd.DataFrame())
             if df.empty:
                 continue
-            for i, row_vals in enumerate(
-                dataframe_to_rows(df, index=False, header=False), start=1
-            ):
-                for j, val in enumerate(row_vals, start=1):
-                    c = ws.cell(i, j, None if val == "" else val)
-                    c.font = _FONT_STRIKE
-            _finalise_inline(ws, old_src_wb, name)
+            src_ws = _get_src_ws(old_src_wb, name)
+            nr, nc = len(df), len(df.columns)
+            for i in range(nr):
+                for j in range(nc):
+                    val     = cell_str(df.iat[i, j])
+                    c       = ws.cell(i + 1, j + 1, None if val == "" else val)
+                    src_c   = src_ws.cell(i + 1, j + 1) if src_ws else None
+                    # Copy source formatting, then override font with strikethrough
+                    _copy_cell_style(src_c, c)
+                    c.font = _font_with_strike(src_c.font if src_c else None)
+            _finalise_inline(ws, old_src_wb, name, src_ws)
 
         # ── Common sheet ──────────────────────────────────────────────────
         else:
@@ -1130,6 +1226,9 @@ def build_inline_excel(
                 _TAB_COLOR["modified"] if has_chg else _TAB_COLOR["unchanged"]
             )
 
+            new_src_ws = _get_src_ws(new_src_wb, name)
+            old_src_ws = _get_src_ws(old_src_wb, name)
+
             for i in range(nr):
                 excel_row = i + 1
                 rs = row_status.get(i, "same")
@@ -1140,34 +1239,36 @@ def build_inline_excel(
                     c       = ws.cell(excel_row, j + 1)
 
                     if rs == "deleted":
-                        # Entire row deleted — strikethrough every cell
-                        c.value = None if old_val == "" else old_val
-                        c.font  = _FONT_STRIKE
+                        # Row only exists in old file — use old source formatting
+                        c.value  = None if old_val == "" else old_val
+                        src_c    = old_src_ws.cell(excel_row, j + 1) if old_src_ws else None
+                        _copy_cell_style(src_c, c)
+                        c.font   = _font_with_strike(src_c.font if src_c else None)
 
                     elif rs == "added":
-                        # Entire row added — green fill
-                        c.value = None if new_val == "" else new_val
-                        c.fill  = _FILL_ADDED
-                        c.font  = _FONT_NORMAL
+                        # Row only exists in new file — use new source formatting + green fill
+                        c.value  = None if new_val == "" else new_val
+                        src_c    = new_src_ws.cell(excel_row, j + 1) if new_src_ws else None
+                        _copy_cell_style(src_c, c)
+                        c.fill   = _FILL_ADDED   # override fill to mark added row
 
                     elif cs == "changed":
-                        # Write a plain-text placeholder (new value) so openpyxl
-                        # writes a normal shared-string cell — not inlineStr.
-                        # The ZIP post-processor will replace this with proper
-                        # OOXML rich text (~~old~~  new) after saving.
+                        # Cell changed — copy new source formatting; ZIP patcher adds ~~old~~ new
+                        src_c  = new_src_ws.cell(excel_row, j + 1) if new_src_ws else None
+                        _copy_cell_style(src_c, c)
                         placeholder = new_val if new_val else old_val
                         c.value = placeholder if placeholder else None
-                        c.font  = _FONT_NORMAL
                         if placeholder:
                             ref = f"{get_column_letter(j + 1)}{excel_row}"
                             rich_cells.setdefault(name, {})[ref] = (old_val, new_val)
 
                     else:
-                        # Unchanged
+                        # Unchanged — preserve new source formatting exactly
                         c.value = None if new_val == "" else new_val
-                        c.font  = _FONT_NORMAL
+                        src_c   = new_src_ws.cell(excel_row, j + 1) if new_src_ws else None
+                        _copy_cell_style(src_c, c)
 
-            _finalise_inline(ws, new_src_wb, name)
+            _finalise_inline(ws, new_src_wb, name, new_src_ws)
 
     buf = io.BytesIO()
     wb.save(buf)
