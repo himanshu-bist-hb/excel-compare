@@ -16,6 +16,7 @@ import streamlit as st
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Config
@@ -718,18 +719,25 @@ def build_sidebyside_excel(
 
     Layout per sheet
     ────────────────
-    • Row 1        : "◄ OLD — <file>" | separator | "NEW — <file> ►"
-    • Rows 2+      : aligned data, OLD on left | narrow separator column | NEW on right
+    • Data starts at row 1 — no header banner row
+    • OLD data on left | narrow grey separator column | NEW data on right
 
     Colour coding
     ─────────────
     • Changed cell  OLD side : strikethrough red font
     • Changed cell  NEW side : yellow background  (#FFFF00)
-    • Deleted row   OLD side : light-red fill   (same as highlighted report)
-    • Added row     NEW side : light-green fill (same as highlighted report)
-    • Deleted sheet OLD side : pink-red fill    (#FFCCCC)
-    • New sheet     NEW side : light-green fill (#CCFFCC)
-    • Separator column       : mid-grey with thick medium borders
+    • Deleted row   OLD side : light-red fill
+    • Added row     NEW side : light-green fill
+    • Deleted sheet OLD side : pink-red fill (#FFCCCC), right side blank
+    • New sheet     NEW side : light-green fill (#CCFFCC), left side blank
+    • Separator column       : mid-grey fill, no borders
+
+    Print behaviour
+    ───────────────
+    • No cell gridlines shown (matches source file appearance)
+    • Headers / footers copied from source workbook
+    • Page margins / orientation / paper size copied from source
+    • fitToWidth = 1 so both OLD and NEW columns print on the same page
     """
 
     old_src_wb = _load_source_wb(old_raw, old_filename)
@@ -738,11 +746,21 @@ def build_sidebyside_excel(
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
-    old_label = f"◄  OLD  —  {old_filename}"
-    new_label = f"NEW  —  {new_filename}  ►"
-
     # Sheets in ascending alphabetical order (all unique names)
     all_names = sorted(set(list(old_sheets.keys()) + list(new_sheets.keys())))
+
+    def _finalise(ws, sep_col, src_wb, src_name):
+        """Apply common post-write settings: widths, no gridlines, print setup."""
+        _auto_width(ws)
+        ws.column_dimensions[get_column_letter(sep_col)].width = 3
+        # Hide cell grid lines to match source file appearance
+        ws.sheet_view.showGridLines = False
+        # Copy headers / footers / margins / orientation from source
+        _copy_print_settings(ws, src_wb, src_name)
+        # Force both OLD and NEW columns onto one page width when printing
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0   # unlimited rows — let it flow vertically
 
     for name in all_names:
         safe_name = name[:31]
@@ -760,26 +778,18 @@ def build_sidebyside_excel(
             sep_col   = nc_old + 1
             new_start = sep_col + 1
 
-            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
-
             for i, row_vals in enumerate(
-                dataframe_to_rows(df, index=False, header=False), start=2
+                dataframe_to_rows(df, index=False, header=False), start=1
             ):
-                for j in range(1, nc_old + 1):   # OLD side — empty
+                for j in range(1, nc_old + 1):          # OLD side — empty
                     ws.cell(i, j)
-                s = ws.cell(i, sep_col)           # Separator
-                s.fill   = _FILL_SBS_SEP_DATA
-                s.border = _BORDER_SEP_DATA
+                ws.cell(i, sep_col).fill = _FILL_SBS_SEP_DATA   # Separator
                 for jj, val in enumerate(row_vals, start=new_start):  # NEW — green
                     c = ws.cell(i, jj, None if val == "" else val)
                     c.fill = _FILL_SBS_NEW_SHEET
                     c.font = _FONT_NORMAL
 
-            _apply_border_region(ws, 1, nr + 1, 1, nc_old)
-            _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
-            _auto_width(ws)
-            ws.column_dimensions[get_column_letter(sep_col)].width = 3
-            _copy_print_settings(ws, new_src_wb, name)
+            _finalise(ws, sep_col, new_src_wb, name)
 
         # ── Deleted sheet (only in original file) ────────────────────────
         elif name in deleted_only:
@@ -793,26 +803,18 @@ def build_sidebyside_excel(
             sep_col   = nc_old + 1
             new_start = sep_col + 1
 
-            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
-
             for i, row_vals in enumerate(
-                dataframe_to_rows(df, index=False, header=False), start=2
+                dataframe_to_rows(df, index=False, header=False), start=1
             ):
-                for j, val in enumerate(row_vals, start=1):   # OLD side — red
+                for j, val in enumerate(row_vals, start=1):     # OLD side — red
                     c = ws.cell(i, j, None if val == "" else val)
                     c.fill = _FILL_SBS_DEL_SHEET
                     c.font = _FONT_NORMAL
-                s = ws.cell(i, sep_col)                        # Separator
-                s.fill   = _FILL_SBS_SEP_DATA
-                s.border = _BORDER_SEP_DATA
-                for jj in range(new_start, new_start + nc_new):  # NEW side — empty
+                ws.cell(i, sep_col).fill = _FILL_SBS_SEP_DATA   # Separator
+                for jj in range(new_start, new_start + nc_new): # NEW side — empty
                     ws.cell(i, jj)
 
-            _apply_border_region(ws, 1, nr + 1, 1, nc_old)
-            _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
-            _auto_width(ws)
-            ws.column_dimensions[get_column_letter(sep_col)].width = 3
-            _copy_print_settings(ws, old_src_wb, name)
+            _finalise(ws, sep_col, old_src_wb, name)
 
         # ── Common sheet (present in both files) ─────────────────────────
         else:
@@ -845,10 +847,8 @@ def build_sidebyside_excel(
             sep_col   = nc_old + 1
             new_start = sep_col + 1
 
-            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
-
             for i in range(nr):
-                excel_row = i + 2
+                excel_row = i + 1      # data begins at row 1, no header banner
                 rs = row_status.get(i, "same")
 
                 # OLD side ──────────────────────────────────────────────
@@ -868,9 +868,7 @@ def build_sidebyside_excel(
                         c.font = _FONT_NORMAL
 
                 # Separator ─────────────────────────────────────────────
-                s = ws.cell(excel_row, sep_col)
-                s.fill   = _FILL_SBS_SEP_DATA
-                s.border = _BORDER_SEP_DATA
+                ws.cell(excel_row, sep_col).fill = _FILL_SBS_SEP_DATA
 
                 # NEW side ──────────────────────────────────────────────
                 for j in range(nc_new):
@@ -878,7 +876,7 @@ def build_sidebyside_excel(
                     cs  = cell_status.get((i, j), "same")
                     c   = ws.cell(excel_row, new_start + j, None if val == "" else val)
                     if rs == "added":
-                        c.fill = _FILL_ADDED    # light green
+                        c.fill = _FILL_ADDED
                         c.font = _FONT_NORMAL
                     elif rs == "deleted":
                         c.value = None
@@ -889,15 +887,7 @@ def build_sidebyside_excel(
                     else:
                         c.font = _FONT_NORMAL
 
-            if nr > 0:
-                if nc_old > 0:
-                    _apply_border_region(ws, 1, nr + 1, 1, nc_old)
-                if nc_new > 0:
-                    _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
-
-            _auto_width(ws)
-            ws.column_dimensions[get_column_letter(sep_col)].width = 3
-            _copy_print_settings(ws, new_src_wb, name)
+            _finalise(ws, sep_col, new_src_wb, name)
 
     buf = io.BytesIO()
     wb.save(buf)
