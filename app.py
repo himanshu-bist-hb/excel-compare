@@ -13,6 +13,8 @@ import numpy as np
 import openpyxl
 import pandas as pd
 import streamlit as st
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -932,6 +934,176 @@ def build_sidebyside_excel(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Inline-diff Excel export
+# ─────────────────────────────────────────────────────────────────────────────
+
+# InlineFont styles reused across all inline-diff cells
+_IF_STRIKE = InlineFont(strike=True, color="C00000")   # old value — red strikethrough
+_IF_NORMAL = InlineFont()                               # new / unchanged value
+
+
+def _rich_changed(old_val: str, new_val: str):
+    """
+    Return a CellRichText showing:  ~~old~~  new
+    Falls back to plain strings when one side is empty.
+    """
+    if old_val and new_val:
+        return CellRichText([
+            TextBlock(_IF_STRIKE, old_val),
+            "  ",
+            TextBlock(_IF_NORMAL, new_val),
+        ])
+    if old_val:
+        return CellRichText([TextBlock(_IF_STRIKE, old_val)])
+    return new_val or None
+
+
+def build_inline_excel(
+    old_sheets:   Dict[str, pd.DataFrame],
+    new_sheets:   Dict[str, pd.DataFrame],
+    new_only:     Set[str],
+    deleted_only: Set[str],
+    sheet_stats:  Dict[str, dict],
+    sheet_data:   Dict[str, tuple],
+    old_filename: str,
+    new_filename: str,
+    old_raw:      bytes,
+    new_raw:      bytes,
+) -> bytes:
+    """
+    Build an inline-diff Excel workbook.
+
+    Each sheet is a single table — no side-by-side doubling.
+
+    Cell rendering
+    ──────────────
+    • Changed cell     : ~~old_value~~  new_value  (rich text in one cell)
+    • Unchanged cell   : value (no decoration)
+    • Deleted row      : every cell strikethrough
+    • Added row        : every cell, light-green fill
+    • Deleted sheet    : all values strikethrough, red tab
+    • New sheet        : all values, green fill, green tab
+
+    Print behaviour
+    ───────────────
+    • Landscape orientation, fitToWidth = 1
+    • Headers / footers / margins copied from source workbook
+    • No gridlines shown
+    """
+    old_src_wb = _load_source_wb(old_raw, old_filename)
+    new_src_wb = _load_source_wb(new_raw, new_filename)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    all_names = sorted(set(list(old_sheets.keys()) + list(new_sheets.keys())))
+
+    def _finalise_inline(ws, src_wb, src_name):
+        _auto_width(ws)
+        ws.sheet_view.showGridLines = False
+        _copy_print_settings(ws, src_wb, src_name)
+        ws.page_setup.orientation = "landscape"
+        ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
+
+    for name in all_names:
+        ws = wb.create_sheet(title=name[:31])
+
+        # ── New sheet ─────────────────────────────────────────────────────
+        if name in new_only:
+            ws.sheet_properties.tabColor = _TAB_COLOR["new"]
+            df = new_sheets.get(name, pd.DataFrame())
+            if df.empty:
+                continue
+            for i, row_vals in enumerate(
+                dataframe_to_rows(df, index=False, header=False), start=1
+            ):
+                for j, val in enumerate(row_vals, start=1):
+                    c = ws.cell(i, j, None if val == "" else val)
+                    c.fill = _FILL_ADDED
+                    c.font = _FONT_NORMAL
+            _finalise_inline(ws, new_src_wb, name)
+
+        # ── Deleted sheet ─────────────────────────────────────────────────
+        elif name in deleted_only:
+            ws.sheet_properties.tabColor = _TAB_COLOR["deleted"]
+            df = old_sheets.get(name, pd.DataFrame())
+            if df.empty:
+                continue
+            for i, row_vals in enumerate(
+                dataframe_to_rows(df, index=False, header=False), start=1
+            ):
+                for j, val in enumerate(row_vals, start=1):
+                    c = ws.cell(i, j, None if val == "" else val)
+                    c.font = _FONT_STRIKE
+            _finalise_inline(ws, old_src_wb, name)
+
+        # ── Common sheet ──────────────────────────────────────────────────
+        else:
+            old_df = old_sheets.get(name, pd.DataFrame())
+            new_df = new_sheets.get(name, pd.DataFrame())
+
+            if name in sheet_data:
+                old_a, new_a, cell_status, row_status = sheet_data[name]
+            else:
+                old_a, new_a, cell_status, row_status, _ = compare_dataframes(old_df, new_df)
+
+            if old_a.empty and new_a.empty:
+                continue
+
+            nr = max(len(old_a) if not old_a.empty else 0,
+                     len(new_a) if not new_a.empty else 0)
+            nc = max(len(old_a.columns) if not old_a.empty else 0,
+                     len(new_a.columns) if not new_a.empty else 0)
+
+            sv      = sheet_stats.get(name, {})
+            has_chg = (
+                sv.get("changed_cells", 0)
+                + sv.get("added_rows",   0)
+                + sv.get("deleted_rows", 0)
+            ) > 0
+            ws.sheet_properties.tabColor = (
+                _TAB_COLOR["modified"] if has_chg else _TAB_COLOR["unchanged"]
+            )
+
+            for i in range(nr):
+                rs = row_status.get(i, "same")
+                for j in range(nc):
+                    cs      = cell_status.get((i, j), "same")
+                    old_val = cell_str(old_a.iat[i, j]) if i < len(old_a) else ""
+                    new_val = cell_str(new_a.iat[i, j]) if i < len(new_a) else ""
+                    c       = ws.cell(i + 1, j + 1)
+
+                    if rs == "deleted":
+                        # Entire row deleted — strikethrough every cell
+                        c.value = None if old_val == "" else old_val
+                        c.font  = _FONT_STRIKE
+
+                    elif rs == "added":
+                        # Entire row added — green fill
+                        c.value = None if new_val == "" else new_val
+                        c.fill  = _FILL_ADDED
+                        c.font  = _FONT_NORMAL
+
+                    elif cs == "changed":
+                        # Individual cell changed — rich text: ~~old~~  new
+                        c.value = _rich_changed(old_val, new_val)
+                        c.font  = _FONT_NORMAL
+
+                    else:
+                        # Unchanged
+                        c.value = None if new_val == "" else new_val
+                        c.font  = _FONT_NORMAL
+
+            _finalise_inline(ws, new_src_wb, name)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Session-state initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -943,6 +1115,10 @@ if "sbs_report_bytes" not in st.session_state:
     st.session_state.sbs_report_bytes = None
 if "sbs_report_filename" not in st.session_state:
     st.session_state.sbs_report_filename = None
+if "inline_report_bytes" not in st.session_state:
+    st.session_state.inline_report_bytes = None
+if "inline_report_filename" not in st.session_state:
+    st.session_state.inline_report_filename = None
 if "last_file_ids" not in st.session_state:
     st.session_state.last_file_ids = (None, None)
 
@@ -1084,6 +1260,13 @@ if st.session_state.last_file_ids != current_ids:
             old_raw, new_raw,
         )
         st.session_state.sbs_report_filename = f"excel_diff_sidebyside_{ts}.xlsx"
+    with st.spinner("Building inline diff Excel…"):
+        st.session_state.inline_report_bytes = build_inline_excel(
+            old_sheets, new_sheets, new_only, deleted_only,
+            sheet_stats, sheet_data, old_file.name, new_file.name,
+            old_raw, new_raw,
+        )
+        st.session_state.inline_report_filename = f"excel_diff_inline_{ts}.xlsx"
     st.session_state.last_file_ids = current_ids
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1320,16 +1503,32 @@ with exp_col2:
         help="One row per sheet — quick overview of all changes",
     )
 
-st.download_button(
-    label="📋 Download Side-by-Side Comparison Excel",
-    data=st.session_state.sbs_report_bytes,
-    file_name=st.session_state.sbs_report_filename,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-    help=(
-        "Each sheet shows OLD data on the left and NEW data on the right — "
-        "strikethrough marks changed old values, yellow highlights changed new values, "
-        "red = deleted sheet, green = new sheet. Sheets sorted A→Z. "
-        "Print headers & footers from the source files are preserved."
-    ),
-)
+dl_col1, dl_col2 = st.columns(2)
+
+with dl_col1:
+    st.download_button(
+        label="📋 Download Side-by-Side Comparison Excel",
+        data=st.session_state.sbs_report_bytes,
+        file_name=st.session_state.sbs_report_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help=(
+            "Each sheet: OLD table on the left, NEW table on the right — "
+            "strikethrough = changed old value, yellow = changed new value, "
+            "red tab = deleted sheet, green tab = new sheet. Sheets sorted A→Z."
+        ),
+    )
+
+with dl_col2:
+    st.download_button(
+        label="🔀 Download Inline Diff Excel",
+        data=st.session_state.inline_report_bytes,
+        file_name=st.session_state.inline_report_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help=(
+            "Single table per sheet — changed cells show ~~old~~  new in one cell, "
+            "deleted rows are struck through, added rows are green, "
+            "deleted sheets show all values struck through, new sheets have green fill."
+        ),
+    )
