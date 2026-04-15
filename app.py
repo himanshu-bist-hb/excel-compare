@@ -791,9 +791,10 @@ def build_sidebyside_excel(
         ws.column_dimensions[get_column_letter(sep_col)].width = 3
         # Hide cell grid lines to match source file appearance
         ws.sheet_view.showGridLines = False
-        # Copy headers / footers / margins / orientation from source
+        # Copy headers / footers / margins from source
         _copy_print_settings(ws, src_wb, src_name)
-        # Force both OLD and NEW columns onto one page width when printing
+        # Force landscape + both OLD and NEW columns onto one page width
+        ws.page_setup.orientation = 'landscape'
         ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
         ws.page_setup.fitToWidth  = 1
         ws.page_setup.fitToHeight = 0   # unlimited rows — let it flow vertically
