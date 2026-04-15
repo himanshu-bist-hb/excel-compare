@@ -475,8 +475,8 @@ def build_summary_sheet(
 
     # Meta rows
     meta = [
-        ("Original File",  old_filename),
-        ("Revised File",   new_filename),
+        ("Current Pages",  old_filename),
+        ("Proposed Pages", new_filename),
         ("Generated",      datetime.now().strftime("%Y-%m-%d  %H:%M:%S")),
     ]
     for idx, (label, value) in enumerate(meta, start=2):
@@ -1289,14 +1289,12 @@ if "report_bytes" not in st.session_state:
     st.session_state.report_bytes = None
 if "report_filename" not in st.session_state:
     st.session_state.report_filename = None
-if "sbs_report_bytes" not in st.session_state:
-    st.session_state.sbs_report_bytes = None
-if "sbs_report_filename" not in st.session_state:
-    st.session_state.sbs_report_filename = None
-if "inline_report_bytes" not in st.session_state:
-    st.session_state.inline_report_bytes = None
-if "inline_report_filename" not in st.session_state:
-    st.session_state.inline_report_filename = None
+if "tracked_report_bytes" not in st.session_state:
+    st.session_state.tracked_report_bytes = None
+if "tracked_report_filename" not in st.session_state:
+    st.session_state.tracked_report_filename = None
+if "tracked_fmt" not in st.session_state:
+    st.session_state.tracked_fmt = None
 if "last_file_ids" not in st.session_state:
     st.session_state.last_file_ids = (None, None)
 
@@ -1320,7 +1318,7 @@ up_col1, up_col2 = st.columns(2)
 
 with up_col1:
     st.markdown(
-        '<span class="upload-label">📁 Original File &nbsp;(Old / Baseline)</span>',
+        '<span class="upload-label">📁 Current Pages</span>',
         unsafe_allow_html=True,
     )
     old_file = st.file_uploader(
@@ -1328,12 +1326,12 @@ with up_col1:
         type=["xlsx", "xls"],
         key="old_file",
         label_visibility="collapsed",
-        help="The file you are comparing FROM",
+        help="The existing / current version of the pages",
     )
 
 with up_col2:
     st.markdown(
-        '<span class="upload-label">📁 Revised File &nbsp;(New / Updated)</span>',
+        '<span class="upload-label">📁 Proposed Pages</span>',
         unsafe_allow_html=True,
     )
     new_file = st.file_uploader(
@@ -1341,26 +1339,36 @@ with up_col2:
         type=["xlsx", "xls"],
         key="new_file",
         label_visibility="collapsed",
-        help="The file you are comparing TO",
+        help="The proposed / updated version of the pages",
     )
 
-# ── Export format selector ───────────────────────────────────────────────────
+# ── Format selector + Generate button ────────────────────────────────────────
 st.markdown(
-    '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.8rem 0 0.3rem">'
-    '🔧 Additional export format</p>',
+    '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
+    '🔧 Tracked Pages format</p>',
     unsafe_allow_html=True,
 )
-st.radio(
-    "export_format_selector",
-    options=["Side-by-Side", "Inline Diff"],
-    horizontal=True,
-    label_visibility="collapsed",
-    key="export_fmt",
-    help=(
-        "Side-by-Side: OLD table on the left, NEW table on the right in each sheet.\n"
-        "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
-    ),
-)
+fmt_col, btn_col = st.columns([2, 1])
+with fmt_col:
+    st.radio(
+        "export_format_selector",
+        options=["Side-by-Side", "Inline Diff"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="export_fmt",
+        help=(
+            "Side-by-Side: Current Pages on the left, Proposed Pages on the right.\n"
+            "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
+        ),
+    )
+with btn_col:
+    _generate_clicked = st.button(
+        "⚙️ Generate Tracked Pages",
+        type="primary",
+        use_container_width=True,
+        disabled=not (old_file and new_file),
+        help="Upload both files first, then click to create the Tracked Pages Excel",
+    )
 
 # ── Instructions (shown only while files are missing) ────────────────────────
 if not old_file or not new_file:
@@ -1369,19 +1377,20 @@ if not old_file or not new_file:
         <div class="info-box">
           <strong>How to use Excel Comparator Pro</strong>
           <ol>
-            <li>Upload your <strong>Original (Old / Baseline)</strong> Excel file on the left.</li>
-            <li>Upload your <strong>Revised (New / Updated)</strong> Excel file on the right.</li>
-            <li>Comparison runs automatically — no extra button required.</li>
+            <li>Upload your <strong>Current Pages</strong> Excel file on the left.</li>
+            <li>Upload your <strong>Proposed Pages</strong> Excel file on the right.</li>
+            <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong> format.</li>
+            <li>Click <strong>Generate Tracked Pages</strong> to create the comparison Excel.</li>
           </ol>
           <strong>What is detected:</strong>
           <ul>
-            <li>🟢 <strong>New sheets</strong> — sheet added in the revised file</li>
-            <li>🔴 <strong>Deleted sheets</strong> — sheet removed in the revised file</li>
+            <li>🟢 <strong>New sheets</strong> — sheet added in the Proposed Pages</li>
+            <li>🔴 <strong>Deleted sheets</strong> — sheet removed from the Current Pages</li>
             <li>🟡 <strong>Changed cells</strong> — yellow highlight with old ↦ new value</li>
             <li>🟢 <strong>Added rows</strong> — full row highlighted green</li>
             <li>🔴 <strong>Deleted rows</strong> — full row highlighted red</li>
           </ul>
-          Download a <strong>highlighted Excel report</strong> with colour-coded tabs and cells.
+          Download the <strong>Tracked Pages Excel</strong> with colour-coded tabs and cells.
         </div>
         """,
         unsafe_allow_html=True,
@@ -1437,40 +1446,47 @@ modified_count = sum(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auto-generate the highlighted Excel report (once per file pair)
+# Auto-generate highlighted report once per file pair; clear tracked pages
+# when the file pair changes so a stale download is never shown.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_fmt = st.session_state.get("export_fmt", "Side-by-Side")
-current_ids = (id(old_raw), id(new_raw), _fmt)
-if st.session_state.last_file_ids != current_ids:
+_pair_ids = (id(old_raw), id(new_raw))
+if st.session_state.last_file_ids != _pair_ids:
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with st.spinner("Building highlighted Excel report…"):
+    with st.spinner("Analysing files…"):
         st.session_state.report_bytes = build_highlighted_excel(
             old_sheets, new_sheets, ordered, new_only, deleted_only,
             sheet_stats, old_file.name, new_file.name,
         )
         st.session_state.report_filename = f"excel_diff_{ts}.xlsx"
+    # Clear any previously generated tracked pages for the old file pair
+    st.session_state.tracked_report_bytes    = None
+    st.session_state.tracked_report_filename = None
+    st.session_state.tracked_fmt             = None
+    st.session_state.last_file_ids           = _pair_ids
+
+# ── Generate Tracked Pages on button click ───────────────────────────────────
+
+if _generate_clicked:
+    _fmt = st.session_state.get("export_fmt", "Side-by-Side")
+    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
     if _fmt == "Side-by-Side":
-        with st.spinner("Building side-by-side comparison Excel…"):
-            st.session_state.sbs_report_bytes = build_sidebyside_excel(
+        with st.spinner("Generating Tracked Pages (Side-by-Side)…"):
+            st.session_state.tracked_report_bytes = build_sidebyside_excel(
                 old_sheets, new_sheets, new_only, deleted_only,
                 sheet_stats, sheet_data, old_file.name, new_file.name,
                 old_raw, new_raw,
             )
-            st.session_state.sbs_report_filename = f"excel_diff_sidebyside_{ts}.xlsx"
-        st.session_state.inline_report_bytes    = None
-        st.session_state.inline_report_filename = None
+            st.session_state.tracked_report_filename = f"tracked_pages_sidebyside_{ts}.xlsx"
     else:
-        with st.spinner("Building inline diff Excel…"):
-            st.session_state.inline_report_bytes = build_inline_excel(
+        with st.spinner("Generating Tracked Pages (Inline Diff)…"):
+            st.session_state.tracked_report_bytes = build_inline_excel(
                 old_sheets, new_sheets, new_only, deleted_only,
                 sheet_stats, sheet_data, old_file.name, new_file.name,
                 old_raw, new_raw,
             )
-            st.session_state.inline_report_filename = f"excel_diff_inline_{ts}.xlsx"
-        st.session_state.sbs_report_bytes    = None
-        st.session_state.sbs_report_filename = None
-    st.session_state.last_file_ids = current_ids
+            st.session_state.tracked_report_filename = f"tracked_pages_inline_{ts}.xlsx"
+    st.session_state.tracked_fmt = _fmt
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary metrics
@@ -1584,7 +1600,7 @@ for sname, tab in zip(ordered, tabs):
         # ── New sheet ──────────────────────────────────────────────────────
         if sname in new_only:
             st.success(
-                f"**'{sname}'** is a **new sheet** — it exists only in the revised file."
+                f"**'{sname}'** is a **new sheet** — it exists only in the Proposed Pages."
             )
             df = new_sheets[sname]
             st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
@@ -1593,7 +1609,7 @@ for sname, tab in zip(ordered, tabs):
         # ── Deleted sheet ──────────────────────────────────────────────────
         elif sname in deleted_only:
             st.error(
-                f"**'{sname}'** was **deleted** — it exists only in the original file."
+                f"**'{sname}'** was **deleted** — it exists only in the Current Pages."
             )
             df = old_sheets[sname]
             st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
@@ -1706,31 +1722,31 @@ with exp_col2:
         help="One row per sheet — quick overview of all changes",
     )
 
-_active_fmt = st.session_state.get("export_fmt", "Side-by-Side")
-if _active_fmt == "Side-by-Side":
+if st.session_state.tracked_report_bytes:
+    _tfmt = st.session_state.tracked_fmt or "Side-by-Side"
+    _tlabel = (
+        "📋 Download Tracked Pages — Side-by-Side"
+        if _tfmt == "Side-by-Side"
+        else "🔀 Download Tracked Pages — Inline Diff"
+    )
+    _thelp = (
+        "Each sheet: Current Pages on the left, Proposed Pages on the right — "
+        "strikethrough = changed current value, yellow = changed proposed value."
+        if _tfmt == "Side-by-Side"
+        else "Single table per sheet — changed cells show ~~current~~  proposed in one cell."
+    )
     st.download_button(
-        label="📋 Download Side-by-Side Comparison Excel",
-        data=st.session_state.sbs_report_bytes,
-        file_name=st.session_state.sbs_report_filename,
+        label=_tlabel,
+        data=st.session_state.tracked_report_bytes,
+        file_name=st.session_state.tracked_report_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
-        help=(
-            "Each sheet: OLD table on the left, NEW table on the right — "
-            "strikethrough = changed old value, yellow = changed new value, "
-            "red tab = deleted sheet, green tab = new sheet. Sheets sorted A→Z."
-        ),
+        type="primary",
+        help=_thelp,
     )
 else:
-    st.download_button(
-        label="🔀 Download Inline Diff Excel",
-        data=st.session_state.inline_report_bytes,
-        file_name=st.session_state.inline_report_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        help=(
-            "Single table per sheet — changed cells show ~~old~~  new in one cell "
-            "(old value in red with strikethrough, new value normal beside it). "
-            "Deleted rows struck through, added rows green, deleted sheets all struck through, "
-            "new sheets green fill. Print settings match the source file exactly."
-        ),
+    st.info(
+        "Select **Side-by-Side** or **Inline Diff** above and click "
+        "**⚙️ Generate Tracked Pages** to create the comparison Excel.",
+        icon="ℹ️",
     )
