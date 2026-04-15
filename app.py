@@ -6,6 +6,7 @@ A professional Streamlit app to compare two Excel files at sheet and cell level.
 import copy
 import io
 import re
+import zipfile
 from datetime import datetime
 from typing import Dict, List, Set, Tuple
 
@@ -13,8 +14,6 @@ import numpy as np
 import openpyxl
 import pandas as pd
 import streamlit as st
-from openpyxl.cell.rich_text import CellRichText, TextBlock
-from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -934,31 +933,90 @@ def build_sidebyside_excel(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Inline-diff Excel export
+# Inline-diff Excel export — ZIP post-processing for rich text
 # ─────────────────────────────────────────────────────────────────────────────
 
-# InlineFont styles reused across all inline-diff cells
-# 8-char ARGB required — first two chars are alpha; "00" = transparent, "FF" = opaque.
-# "C00000" alone was being stored as "00C00000" (invisible). Use "FFC00000" for
-# fully-opaque dark red strikethrough.
-_IF_STRIKE = InlineFont(strike=True, color="FFC00000", rFont="Segoe UI", sz=10)
-_IF_NORMAL = InlineFont(rFont="Segoe UI", sz=10)
+def _xml_esc(s: str) -> str:
+    """Escape characters that are special in XML text content."""
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
 
 
-def _rich_changed(old_val: str, new_val: str):
+def _replace_cell_rich(xml_text: str, ref: str, old_val: str, new_val: str) -> str:
     """
-    Return a CellRichText showing:  ~~old~~  new
-    Falls back to plain strings when one side is empty.
+    In the raw worksheet XML, replace the cell at *ref* with an inlineStr
+    cell that renders  ~~old_val~~  new_val  using OOXML rich text runs.
+
+    We use a regex that matches <c r="REF" ...>...</c> and replaces the
+    whole element with a hand-crafted <is> block.  This avoids using
+    openpyxl's CellRichText which infects the entire sheet with inlineStr.
     """
     if old_val and new_val:
-        return CellRichText([
-            TextBlock(_IF_STRIKE, old_val),
-            "  ",
-            TextBlock(_IF_NORMAL, new_val),
-        ])
-    if old_val:
-        return CellRichText([TextBlock(_IF_STRIKE, old_val)])
-    return new_val or None
+        is_xml = (
+            '<r><rPr><strike/><color rgb="FFC00000"/></rPr>'
+            f'<t>{_xml_esc(old_val)}</t></r>'
+            f'<r><t xml:space="preserve">  {_xml_esc(new_val)}</t></r>'
+        )
+    elif old_val:
+        is_xml = (
+            '<r><rPr><strike/><color rgb="FFC00000"/></rPr>'
+            f'<t>{_xml_esc(old_val)}</t></r>'
+        )
+    else:
+        is_xml = f'<t>{_xml_esc(new_val or "")}</t>'
+
+    pat = r'(<c r="' + re.escape(ref) + r'")((?:[^>]*))>(.*?)</c>'
+
+    def _sub(m):
+        # Strip any existing t="..." attribute from the opening tag
+        attrs = re.sub(r'\s+t="[^"]*"', '', m.group(2))
+        return f'{m.group(1)}{attrs} t="inlineStr"><is>{is_xml}</is></c>'
+
+    return re.sub(pat, _sub, xml_text, flags=re.DOTALL)
+
+
+def _patch_inline_rich_cells(
+    wb_bytes: bytes,
+    wb_obj: openpyxl.Workbook,
+    rich_map: Dict[str, Dict[str, tuple]],
+) -> bytes:
+    """
+    Post-process the saved workbook ZIP:  for every (sheet_name → {cell_ref →
+    (old_val, new_val)}) entry in *rich_map*, open the corresponding worksheet
+    XML and replace the placeholder cell with a proper inlineStr rich-text cell.
+
+    This avoids openpyxl's CellRichText which contaminates ALL string cells
+    in a sheet with t="inlineStr", producing invalid OOXML.
+    """
+    # Map worksheet titles to their ZIP paths (xl/worksheets/sheet1.xml etc.)
+    sheet_zip_path = {
+        ws.title: f"xl/worksheets/sheet{i}.xml"
+        for i, ws in enumerate(wb_obj.worksheets, 1)
+    }
+
+    in_buf  = io.BytesIO(wb_bytes)
+    out_buf = io.BytesIO()
+
+    with zipfile.ZipFile(in_buf, "r") as zin:
+        with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                # Check if this ZIP entry is a worksheet we need to patch
+                for sheet_name, cells in rich_map.items():
+                    if sheet_zip_path.get(sheet_name) == item.filename and cells:
+                        xml_text = data.decode("utf-8")
+                        for ref, (old_val, new_val) in cells.items():
+                            xml_text = _replace_cell_rich(xml_text, ref, old_val, new_val)
+                        data = xml_text.encode("utf-8")
+                        break  # each file belongs to at most one sheet
+
+                zout.writestr(item, data)
+
+    return out_buf.getvalue()
 
 
 def build_inline_excel(
@@ -1000,6 +1058,10 @@ def build_inline_excel(
     wb.remove(wb.active)
 
     all_names = sorted(set(list(old_sheets.keys()) + list(new_sheets.keys())))
+
+    # rich_cells tracks cells that need post-processing:
+    # { sheet_name: { "A1": (old_val, new_val), ... } }
+    rich_cells: Dict[str, Dict[str, tuple]] = {}
 
     def _finalise_inline(ws, src_wb, src_name):
         _auto_width(ws)
@@ -1069,12 +1131,13 @@ def build_inline_excel(
             )
 
             for i in range(nr):
+                excel_row = i + 1
                 rs = row_status.get(i, "same")
                 for j in range(nc):
                     cs      = cell_status.get((i, j), "same")
                     old_val = cell_str(old_a.iat[i, j]) if i < len(old_a) else ""
                     new_val = cell_str(new_a.iat[i, j]) if i < len(new_a) else ""
-                    c       = ws.cell(i + 1, j + 1)
+                    c       = ws.cell(excel_row, j + 1)
 
                     if rs == "deleted":
                         # Entire row deleted — strikethrough every cell
@@ -1088,9 +1151,16 @@ def build_inline_excel(
                         c.font  = _FONT_NORMAL
 
                     elif cs == "changed":
-                        # Individual cell changed — rich text: ~~old~~  new
-                        c.value = _rich_changed(old_val, new_val)
+                        # Write a plain-text placeholder (new value) so openpyxl
+                        # writes a normal shared-string cell — not inlineStr.
+                        # The ZIP post-processor will replace this with proper
+                        # OOXML rich text (~~old~~  new) after saving.
+                        placeholder = new_val if new_val else old_val
+                        c.value = placeholder if placeholder else None
                         c.font  = _FONT_NORMAL
+                        if placeholder:
+                            ref = f"{get_column_letter(j + 1)}{excel_row}"
+                            rich_cells.setdefault(name, {})[ref] = (old_val, new_val)
 
                     else:
                         # Unchanged
@@ -1101,7 +1171,13 @@ def build_inline_excel(
 
     buf = io.BytesIO()
     wb.save(buf)
-    return buf.getvalue()
+    raw = buf.getvalue()
+
+    # Post-process: patch changed cells with proper OOXML rich text
+    if any(rich_cells.values()):
+        raw = _patch_inline_rich_cells(raw, wb, rich_cells)
+
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
