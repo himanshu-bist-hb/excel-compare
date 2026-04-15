@@ -633,25 +633,61 @@ def build_highlighted_excel(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_source_wb(raw: bytes, filename: str):
-    """Load an openpyxl Workbook from raw bytes for print-settings extraction (xlsx only)."""
+    """Load an openpyxl Workbook from raw bytes (xlsx only, full load so all
+    worksheet properties including headers/footers are available)."""
     try:
         if filename.lower().endswith(".xls"):
             return None
-        return openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+        return openpyxl.load_workbook(io.BytesIO(raw))
     except Exception:
         return None
 
 
 def _copy_print_settings(target_ws, src_wb, sheet_name: str):
-    """Best-effort copy of page setup, margins, and header/footer from source workbook."""
+    """
+    Copy page setup, margins, and header/footer from source workbook.
+
+    page_setup and page_margins are copied attribute-by-attribute to avoid
+    carrying the source sheet's _parent reference into the target, which would
+    cause openpyxl to silently write headers/footers against the wrong sheet.
+    HeaderFooter has no _parent so a deep copy is safe there.
+    """
     if src_wb is None or sheet_name not in src_wb.sheetnames:
         return
     try:
         src_ws = src_wb[sheet_name]
-        target_ws.page_setup    = copy.deepcopy(src_ws.page_setup)
-        target_ws.page_margins  = copy.deepcopy(src_ws.page_margins)
-        target_ws.header_footer = copy.deepcopy(src_ws.header_footer)
-        target_ws.print_area    = None   # column layout differs in SBS view
+
+        # Page setup — individual attributes only
+        src_ps = src_ws.page_setup
+        tgt_ps = target_ws.page_setup
+        for attr in (
+            'orientation', 'paperSize', 'scale', 'firstPageNumber',
+            'pageOrder', 'usePrinterDefaults', 'blackAndWhite', 'draft',
+            'cellComments', 'useFirstPageNumber', 'horizontalDpi',
+            'verticalDpi', 'copies', 'errors',
+        ):
+            try:
+                val = getattr(src_ps, attr, None)
+                if val is not None:
+                    setattr(tgt_ps, attr, val)
+            except Exception:
+                pass
+
+        # Page margins — individual attributes only
+        src_pm = src_ws.page_margins
+        tgt_pm = target_ws.page_margins
+        for attr in ('left', 'right', 'top', 'bottom', 'header', 'footer'):
+            try:
+                val = getattr(src_pm, attr, None)
+                if val is not None:
+                    setattr(tgt_pm, attr, val)
+            except Exception:
+                pass
+
+        # Header / footer — safe to deep copy (no _parent reference).
+        # NOTE: the attribute is "HeaderFooter" (capital H and F) in openpyxl.
+        target_ws.HeaderFooter = copy.deepcopy(src_ws.HeaderFooter)
+
     except Exception:
         pass
 
