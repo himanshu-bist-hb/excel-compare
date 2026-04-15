@@ -3,6 +3,7 @@ Excel Comparator Pro
 A professional Streamlit app to compare two Excel files at sheet and cell level.
 """
 
+import copy
 import io
 import re
 from datetime import datetime
@@ -410,6 +411,23 @@ _THIN_BORDER = Border(
     bottom=Side(style="thin", color="D1D5DB"),
 )
 
+# ── Side-by-side view fills / fonts / borders ────────────────────────────────
+_FILL_SBS_CHG_NEW   = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+_FILL_SBS_NEW_SHEET = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+_FILL_SBS_DEL_SHEET = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
+_FILL_SBS_SEP_DATA  = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+_FILL_SBS_HDR_OLD   = PatternFill(start_color="0F2942", end_color="0F2942", fill_type="solid")
+_FILL_SBS_HDR_NEW   = PatternFill(start_color="1E6091", end_color="1E6091", fill_type="solid")
+_FILL_SBS_HDR_SEP   = PatternFill(start_color="2D2D2D", end_color="2D2D2D", fill_type="solid")
+_FONT_STRIKE        = Font(name="Segoe UI", size=10, strike=True, color="C00000")
+_FONT_SBS_HDR       = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+_BORDER_SEP_DATA    = Border(
+    left=Side(style="medium", color="595959"),
+    right=Side(style="medium", color="595959"),
+    top=Side(style="thin",   color="D0D0D0"),
+    bottom=Side(style="thin", color="D0D0D0"),
+)
+
 
 def _auto_width(ws):
     """Auto-fit column widths (capped at 60)."""
@@ -610,6 +628,283 @@ def build_highlighted_excel(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Side-by-side Excel export
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_source_wb(raw: bytes, filename: str):
+    """Load an openpyxl Workbook from raw bytes for print-settings extraction (xlsx only)."""
+    try:
+        if filename.lower().endswith(".xls"):
+            return None
+        return openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+    except Exception:
+        return None
+
+
+def _copy_print_settings(target_ws, src_wb, sheet_name: str):
+    """Best-effort copy of page setup, margins, and header/footer from source workbook."""
+    if src_wb is None or sheet_name not in src_wb.sheetnames:
+        return
+    try:
+        src_ws = src_wb[sheet_name]
+        target_ws.page_setup    = copy.deepcopy(src_ws.page_setup)
+        target_ws.page_margins  = copy.deepcopy(src_ws.page_margins)
+        target_ws.header_footer = copy.deepcopy(src_ws.header_footer)
+        target_ws.print_area    = None   # column layout differs in SBS view
+    except Exception:
+        pass
+
+
+def _apply_border_region(ws, r1: int, r2: int, c1: int, c2: int):
+    """Apply thin borders to a rectangular region [r1..r2, c1..c2] (1-indexed, inclusive)."""
+    if r2 < r1 or c2 < c1:
+        return
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            ws.cell(r, c).border = _THIN_BORDER
+
+
+def _write_sbs_header(
+    ws, nc_old: int, sep_col: int, nc_new: int, old_label: str, new_label: str
+):
+    """Write the OLD | ◄► | NEW banner (row 1) for the side-by-side sheet."""
+    # OLD header block
+    if nc_old > 0:
+        if nc_old > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=nc_old)
+        c = ws.cell(1, 1)
+        c.value     = old_label
+        c.fill      = _FILL_SBS_HDR_OLD
+        c.font      = _FONT_SBS_HDR
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Separator cell
+    c = ws.cell(1, sep_col)
+    c.value     = "◄  ►"
+    c.fill      = _FILL_SBS_HDR_SEP
+    c.font      = Font(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.border    = _BORDER_SEP_DATA
+
+    # NEW header block
+    new_start = sep_col + 1
+    if nc_new > 0:
+        end_col = new_start + nc_new - 1
+        if nc_new > 1:
+            ws.merge_cells(start_row=1, start_column=new_start, end_row=1, end_column=end_col)
+        c = ws.cell(1, new_start)
+        c.value     = new_label
+        c.fill      = _FILL_SBS_HDR_NEW
+        c.font      = _FONT_SBS_HDR
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.row_dimensions[1].height = 26
+
+
+def build_sidebyside_excel(
+    old_sheets:   Dict[str, pd.DataFrame],
+    new_sheets:   Dict[str, pd.DataFrame],
+    new_only:     Set[str],
+    deleted_only: Set[str],
+    sheet_stats:  Dict[str, dict],
+    sheet_data:   Dict[str, tuple],
+    old_filename: str,
+    new_filename: str,
+    old_raw:      bytes,
+    new_raw:      bytes,
+) -> bytes:
+    """
+    Build a professional side-by-side OLD vs NEW comparison Excel workbook.
+
+    Layout per sheet
+    ────────────────
+    • Row 1        : "◄ OLD — <file>" | separator | "NEW — <file> ►"
+    • Rows 2+      : aligned data, OLD on left | narrow separator column | NEW on right
+
+    Colour coding
+    ─────────────
+    • Changed cell  OLD side : strikethrough red font
+    • Changed cell  NEW side : yellow background  (#FFFF00)
+    • Deleted row   OLD side : light-red fill   (same as highlighted report)
+    • Added row     NEW side : light-green fill (same as highlighted report)
+    • Deleted sheet OLD side : pink-red fill    (#FFCCCC)
+    • New sheet     NEW side : light-green fill (#CCFFCC)
+    • Separator column       : mid-grey with thick medium borders
+    """
+
+    old_src_wb = _load_source_wb(old_raw, old_filename)
+    new_src_wb = _load_source_wb(new_raw, new_filename)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    old_label = f"◄  OLD  —  {old_filename}"
+    new_label = f"NEW  —  {new_filename}  ►"
+
+    # Sheets in ascending alphabetical order (all unique names)
+    all_names = sorted(set(list(old_sheets.keys()) + list(new_sheets.keys())))
+
+    for name in all_names:
+        safe_name = name[:31]
+        ws = wb.create_sheet(title=safe_name)
+
+        # ── New sheet (only in revised file) ─────────────────────────────
+        if name in new_only:
+            ws.sheet_properties.tabColor = _TAB_COLOR["new"]
+            df = new_sheets.get(name, pd.DataFrame())
+            if df.empty:
+                continue
+            nr        = len(df)
+            nc_new    = len(df.columns)
+            nc_old    = nc_new          # blank mirror on the left
+            sep_col   = nc_old + 1
+            new_start = sep_col + 1
+
+            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
+
+            for i, row_vals in enumerate(
+                dataframe_to_rows(df, index=False, header=False), start=2
+            ):
+                for j in range(1, nc_old + 1):   # OLD side — empty
+                    ws.cell(i, j)
+                s = ws.cell(i, sep_col)           # Separator
+                s.fill   = _FILL_SBS_SEP_DATA
+                s.border = _BORDER_SEP_DATA
+                for jj, val in enumerate(row_vals, start=new_start):  # NEW — green
+                    c = ws.cell(i, jj, None if val == "" else val)
+                    c.fill = _FILL_SBS_NEW_SHEET
+                    c.font = _FONT_NORMAL
+
+            _apply_border_region(ws, 1, nr + 1, 1, nc_old)
+            _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
+            _auto_width(ws)
+            ws.column_dimensions[get_column_letter(sep_col)].width = 3
+            _copy_print_settings(ws, new_src_wb, name)
+
+        # ── Deleted sheet (only in original file) ────────────────────────
+        elif name in deleted_only:
+            ws.sheet_properties.tabColor = _TAB_COLOR["deleted"]
+            df = old_sheets.get(name, pd.DataFrame())
+            if df.empty:
+                continue
+            nr        = len(df)
+            nc_old    = len(df.columns)
+            nc_new    = nc_old          # blank mirror on the right
+            sep_col   = nc_old + 1
+            new_start = sep_col + 1
+
+            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
+
+            for i, row_vals in enumerate(
+                dataframe_to_rows(df, index=False, header=False), start=2
+            ):
+                for j, val in enumerate(row_vals, start=1):   # OLD side — red
+                    c = ws.cell(i, j, None if val == "" else val)
+                    c.fill = _FILL_SBS_DEL_SHEET
+                    c.font = _FONT_NORMAL
+                s = ws.cell(i, sep_col)                        # Separator
+                s.fill   = _FILL_SBS_SEP_DATA
+                s.border = _BORDER_SEP_DATA
+                for jj in range(new_start, new_start + nc_new):  # NEW side — empty
+                    ws.cell(i, jj)
+
+            _apply_border_region(ws, 1, nr + 1, 1, nc_old)
+            _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
+            _auto_width(ws)
+            ws.column_dimensions[get_column_letter(sep_col)].width = 3
+            _copy_print_settings(ws, old_src_wb, name)
+
+        # ── Common sheet (present in both files) ─────────────────────────
+        else:
+            old_df = old_sheets.get(name, pd.DataFrame())
+            new_df = new_sheets.get(name, pd.DataFrame())
+
+            if name in sheet_data:
+                old_a, new_a, cell_status, row_status = sheet_data[name]
+            else:
+                old_a, new_a, cell_status, row_status, _ = compare_dataframes(old_df, new_df)
+
+            if old_a.empty and new_a.empty:
+                continue
+
+            nr     = max(len(old_a) if not old_a.empty else 0,
+                         len(new_a) if not new_a.empty else 0)
+            nc_old = len(old_a.columns) if not old_a.empty else 0
+            nc_new = len(new_a.columns) if not new_a.empty else 0
+
+            sv      = sheet_stats.get(name, {})
+            has_chg = (
+                sv.get("changed_cells", 0)
+                + sv.get("added_rows",   0)
+                + sv.get("deleted_rows", 0)
+            ) > 0
+            ws.sheet_properties.tabColor = (
+                _TAB_COLOR["modified"] if has_chg else _TAB_COLOR["unchanged"]
+            )
+
+            sep_col   = nc_old + 1
+            new_start = sep_col + 1
+
+            _write_sbs_header(ws, nc_old, sep_col, nc_new, old_label, new_label)
+
+            for i in range(nr):
+                excel_row = i + 2
+                rs = row_status.get(i, "same")
+
+                # OLD side ──────────────────────────────────────────────
+                for j in range(nc_old):
+                    val = cell_str(old_a.iat[i, j]) if i < len(old_a) else ""
+                    cs  = cell_status.get((i, j), "same")
+                    c   = ws.cell(excel_row, j + 1, None if val == "" else val)
+                    if rs == "deleted":
+                        c.fill = _FILL_DELETED
+                        c.font = _FONT_NORMAL
+                    elif rs == "added":
+                        c.value = None
+                        c.font  = _FONT_NORMAL
+                    elif cs == "changed":
+                        c.font = _FONT_STRIKE   # strikethrough red
+                    else:
+                        c.font = _FONT_NORMAL
+
+                # Separator ─────────────────────────────────────────────
+                s = ws.cell(excel_row, sep_col)
+                s.fill   = _FILL_SBS_SEP_DATA
+                s.border = _BORDER_SEP_DATA
+
+                # NEW side ──────────────────────────────────────────────
+                for j in range(nc_new):
+                    val = cell_str(new_a.iat[i, j]) if i < len(new_a) else ""
+                    cs  = cell_status.get((i, j), "same")
+                    c   = ws.cell(excel_row, new_start + j, None if val == "" else val)
+                    if rs == "added":
+                        c.fill = _FILL_ADDED    # light green
+                        c.font = _FONT_NORMAL
+                    elif rs == "deleted":
+                        c.value = None
+                        c.font  = _FONT_NORMAL
+                    elif cs == "changed":
+                        c.fill = _FILL_SBS_CHG_NEW  # yellow
+                        c.font = _FONT_NORMAL
+                    else:
+                        c.font = _FONT_NORMAL
+
+            if nr > 0:
+                if nc_old > 0:
+                    _apply_border_region(ws, 1, nr + 1, 1, nc_old)
+                if nc_new > 0:
+                    _apply_border_region(ws, 1, nr + 1, new_start, new_start + nc_new - 1)
+
+            _auto_width(ws)
+            ws.column_dimensions[get_column_letter(sep_col)].width = 3
+            _copy_print_settings(ws, new_src_wb, name)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Session-state initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -617,6 +912,10 @@ if "report_bytes" not in st.session_state:
     st.session_state.report_bytes = None
 if "report_filename" not in st.session_state:
     st.session_state.report_filename = None
+if "sbs_report_bytes" not in st.session_state:
+    st.session_state.sbs_report_bytes = None
+if "sbs_report_filename" not in st.session_state:
+    st.session_state.sbs_report_filename = None
 if "last_file_ids" not in st.session_state:
     st.session_state.last_file_ids = (None, None)
 
@@ -744,15 +1043,21 @@ modified_count = sum(
 
 current_ids = (id(old_raw), id(new_raw))
 if st.session_state.last_file_ids != current_ids:
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     with st.spinner("Building highlighted Excel report…"):
         st.session_state.report_bytes = build_highlighted_excel(
             old_sheets, new_sheets, ordered, new_only, deleted_only,
             sheet_stats, old_file.name, new_file.name,
         )
-        st.session_state.report_filename = (
-            f"excel_diff_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        st.session_state.report_filename = f"excel_diff_{ts}.xlsx"
+    with st.spinner("Building side-by-side comparison Excel…"):
+        st.session_state.sbs_report_bytes = build_sidebyside_excel(
+            old_sheets, new_sheets, new_only, deleted_only,
+            sheet_stats, sheet_data, old_file.name, new_file.name,
+            old_raw, new_raw,
         )
-        st.session_state.last_file_ids = current_ids
+        st.session_state.sbs_report_filename = f"excel_diff_sidebyside_{ts}.xlsx"
+    st.session_state.last_file_ids = current_ids
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary metrics
@@ -987,3 +1292,17 @@ with exp_col2:
         use_container_width=True,
         help="One row per sheet — quick overview of all changes",
     )
+
+st.download_button(
+    label="📋 Download Side-by-Side Comparison Excel",
+    data=st.session_state.sbs_report_bytes,
+    file_name=st.session_state.sbs_report_filename,
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+    help=(
+        "Each sheet shows OLD data on the left and NEW data on the right — "
+        "strikethrough marks changed old values, yellow highlights changed new values, "
+        "red = deleted sheet, green = new sheet. Sheets sorted A→Z. "
+        "Print headers & footers from the source files are preserved."
+    ),
+)

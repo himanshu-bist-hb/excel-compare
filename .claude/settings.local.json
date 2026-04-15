@@ -20,7 +20,9 @@
       "Bash(venv/Scripts/python -c ':*)",
       "Bash(venv/Scripts/python -m streamlit run app.py --server.headless true --server.port 8501)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8501/)",
-      "Bash(curl -s http://localhost:8501/)"
+      "Bash(curl -s http://localhost:8501/)",
+      "Bash(dir C:\\\\Users\\\\Himanshu Bist\\\\OneDrive\\\\Desktop\\\\Testing-Projects\\\\test2 *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")"
     ]
   }
 }
