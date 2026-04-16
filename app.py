@@ -1793,6 +1793,10 @@ with _tab_mass:
             st.caption(f"✅ {len(mass_prop_files)} file(s) selected")
 
     # ── Output save location ──────────────────────────────────────────────────
+    # Apply any pending Browse result BEFORE the widget is instantiated
+    if "_mass_path_pending" in st.session_state:
+        st.session_state.mass_output_path = st.session_state.pop("_mass_path_pending")
+
     st.markdown(
         '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
         '💾 Output Save Location</p>',
@@ -1800,7 +1804,6 @@ with _tab_mass:
     )
     path_col, browse_col = st.columns([4, 1])
     with path_col:
-        # Key IS the session-state key — so st.rerun() after Browse shows the picked path
         st.text_input(
             "mass_output_path_input",
             label_visibility="collapsed",
@@ -1816,7 +1819,8 @@ with _tab_mass:
                      help="Open a folder picker dialog (local use only)"):
             _picked = _pick_folder()
             if _picked:
-                st.session_state.mass_output_path = _picked
+                # Stage in a temp key — applied above BEFORE the widget on next run
+                st.session_state["_mass_path_pending"] = _picked
                 st.rerun()
 
     # Validate path and show resolved save folder
