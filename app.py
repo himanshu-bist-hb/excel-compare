@@ -1285,18 +1285,16 @@ def build_inline_excel(
 # Session-state initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-if "report_bytes" not in st.session_state:
-    st.session_state.report_bytes = None
-if "report_filename" not in st.session_state:
-    st.session_state.report_filename = None
+if "comp_data" not in st.session_state:
+    st.session_state.comp_data = None          # dict of all analysis results
+if "comp_file_ids" not in st.session_state:
+    st.session_state.comp_file_ids = (None, None)
 if "tracked_report_bytes" not in st.session_state:
     st.session_state.tracked_report_bytes = None
 if "tracked_report_filename" not in st.session_state:
     st.session_state.tracked_report_filename = None
 if "tracked_fmt" not in st.session_state:
     st.session_state.tracked_fmt = None
-if "last_file_ids" not in st.session_state:
-    st.session_state.last_file_ids = (None, None)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1398,43 +1396,125 @@ if not old_file or not new_file:
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Read both files
+# Detect file pair changes — clear stale results without reading files
 # ─────────────────────────────────────────────────────────────────────────────
 
-with st.spinner("Reading workbooks…"):
-    old_raw = _file_bytes(old_file)
-    new_raw = _file_bytes(new_file)
-    old_sheets = read_excel_sheets(old_raw, old_file.name)
-    new_sheets = read_excel_sheets(new_raw, new_file.name)
+_old_fid = f"{old_file.name}:{old_file.size}"
+_new_fid = f"{new_file.name}:{new_file.size}"
+_cur_fids = (_old_fid, _new_fid)
 
-if not old_sheets or not new_sheets:
+if st.session_state.comp_file_ids != _cur_fids:
+    # New files uploaded — clear everything so stale results are never shown
+    st.session_state.comp_data              = None
+    st.session_state.tracked_report_bytes   = None
+    st.session_state.tracked_report_filename= None
+    st.session_state.tracked_fmt            = None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generate Tracked Pages — ALL processing happens here on button click
+# ─────────────────────────────────────────────────────────────────────────────
+
+if _generate_clicked:
+    _fmt = st.session_state.get("export_fmt", "Side-by-Side")
+    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    with st.spinner("Reading workbooks…"):
+        old_raw    = _file_bytes(old_file)
+        new_raw    = _file_bytes(new_file)
+        old_sheets = read_excel_sheets(old_raw, old_file.name)
+        new_sheets = read_excel_sheets(new_raw, new_file.name)
+
+    if old_sheets and new_sheets:
+        old_names_g: Set[str] = set(old_sheets)
+        new_names_g: Set[str] = set(new_sheets)
+        new_only_g     = new_names_g - old_names_g
+        deleted_only_g = old_names_g - new_names_g
+        common_g       = old_names_g & new_names_g
+        ordered_g: List[str] = list(old_sheets.keys()) + [
+            s for s in new_sheets.keys() if s not in old_sheets
+        ]
+
+        with st.spinner("Computing differences…"):
+            sheet_stats_g: Dict[str, dict] = {}
+            sheet_data_g:  Dict[str, tuple] = {}
+            for sname in common_g:
+                old_a, new_a, cs, rs, stats = compare_dataframes(
+                    old_sheets[sname], new_sheets[sname]
+                )
+                sheet_stats_g[sname] = stats
+                sheet_data_g[sname]  = (old_a, new_a, cs, rs)
+
+        if _fmt == "Side-by-Side":
+            with st.spinner("Generating Tracked Pages (Side-by-Side)…"):
+                tracked_bytes = build_sidebyside_excel(
+                    old_sheets, new_sheets, new_only_g, deleted_only_g,
+                    sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
+                    old_raw, new_raw,
+                )
+                tracked_fname = f"tracked_pages_sidebyside_{ts}.xlsx"
+        else:
+            with st.spinner("Generating Tracked Pages (Inline Diff)…"):
+                tracked_bytes = build_inline_excel(
+                    old_sheets, new_sheets, new_only_g, deleted_only_g,
+                    sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
+                    old_raw, new_raw,
+                )
+                tracked_fname = f"tracked_pages_inline_{ts}.xlsx"
+
+        with st.spinner("Building highlighted summary report…"):
+            report_bytes = build_highlighted_excel(
+                old_sheets, new_sheets, ordered_g, new_only_g, deleted_only_g,
+                sheet_stats_g, old_file.name, new_file.name,
+            )
+            report_fname = f"excel_diff_{ts}.xlsx"
+
+        # Persist all results in session state
+        st.session_state.comp_data = {
+            "old_sheets":   old_sheets,
+            "new_sheets":   new_sheets,
+            "ordered":      ordered_g,
+            "new_only":     new_only_g,
+            "deleted_only": deleted_only_g,
+            "common":       common_g,
+            "sheet_stats":  sheet_stats_g,
+            "sheet_data":   sheet_data_g,
+            "old_name":     old_file.name,
+            "new_name":     new_file.name,
+            "report_bytes": report_bytes,
+            "report_fname": report_fname,
+        }
+        st.session_state.tracked_report_bytes    = tracked_bytes
+        st.session_state.tracked_report_filename = tracked_fname
+        st.session_state.tracked_fmt             = _fmt
+        st.session_state.comp_file_ids           = _cur_fids
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Render analysis + downloads (only after generation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_cd = st.session_state.comp_data
+
+if _cd is None:
+    st.markdown('<hr class="divider">', unsafe_allow_html=True)
+    st.info(
+        "Both files are uploaded. Choose **Side-by-Side** or **Inline Diff** above "
+        "and click **⚙️ Generate Tracked Pages** to run the comparison.",
+        icon="ℹ️",
+    )
     st.stop()
 
-old_names: Set[str] = set(old_sheets)
-new_names: Set[str] = set(new_sheets)
+# Unpack stored results
+old_sheets   = _cd["old_sheets"]
+new_sheets   = _cd["new_sheets"]
+ordered      = _cd["ordered"]
+new_only     = _cd["new_only"]
+deleted_only = _cd["deleted_only"]
+common       = _cd["common"]
+sheet_stats  = _cd["sheet_stats"]
+sheet_data   = _cd["sheet_data"]
 
-new_only     = new_names - old_names
-deleted_only = old_names - new_names
-common       = old_names & new_names
-
-# Preserve natural order: old sheets first, then truly-new sheets appended
-ordered: List[str] = list(old_sheets.keys()) + [
-    s for s in new_sheets.keys() if s not in old_sheets
-]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pre-compute diffs for all common sheets
-# ─────────────────────────────────────────────────────────────────────────────
-
-sheet_stats: Dict[str, dict] = {}
-sheet_data:  Dict[str, tuple] = {}
-
-for sname in common:
-    old_a, new_a, cs, rs, stats = compare_dataframes(
-        old_sheets[sname], new_sheets[sname]
-    )
-    sheet_stats[sname] = stats
-    sheet_data[sname]  = (old_a, new_a, cs, rs)
+old_names = set(old_sheets)
+new_names = set(new_sheets)
 
 total_changes = sum(
     v["changed_cells"] + v["added_rows"] + v["deleted_rows"]
@@ -1445,52 +1525,7 @@ modified_count = sum(
     if v["changed_cells"] + v["added_rows"] + v["deleted_rows"] > 0
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Auto-generate highlighted report once per file pair; clear tracked pages
-# when the file pair changes so a stale download is never shown.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_pair_ids = (id(old_raw), id(new_raw))
-if st.session_state.last_file_ids != _pair_ids:
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    with st.spinner("Analysing files…"):
-        st.session_state.report_bytes = build_highlighted_excel(
-            old_sheets, new_sheets, ordered, new_only, deleted_only,
-            sheet_stats, old_file.name, new_file.name,
-        )
-        st.session_state.report_filename = f"excel_diff_{ts}.xlsx"
-    # Clear any previously generated tracked pages for the old file pair
-    st.session_state.tracked_report_bytes    = None
-    st.session_state.tracked_report_filename = None
-    st.session_state.tracked_fmt             = None
-    st.session_state.last_file_ids           = _pair_ids
-
-# ── Generate Tracked Pages on button click ───────────────────────────────────
-
-if _generate_clicked:
-    _fmt = st.session_state.get("export_fmt", "Side-by-Side")
-    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-    if _fmt == "Side-by-Side":
-        with st.spinner("Generating Tracked Pages (Side-by-Side)…"):
-            st.session_state.tracked_report_bytes = build_sidebyside_excel(
-                old_sheets, new_sheets, new_only, deleted_only,
-                sheet_stats, sheet_data, old_file.name, new_file.name,
-                old_raw, new_raw,
-            )
-            st.session_state.tracked_report_filename = f"tracked_pages_sidebyside_{ts}.xlsx"
-    else:
-        with st.spinner("Generating Tracked Pages (Inline Diff)…"):
-            st.session_state.tracked_report_bytes = build_inline_excel(
-                old_sheets, new_sheets, new_only, deleted_only,
-                sheet_stats, sheet_data, old_file.name, new_file.name,
-                old_raw, new_raw,
-            )
-            st.session_state.tracked_report_filename = f"tracked_pages_inline_{ts}.xlsx"
-    st.session_state.tracked_fmt = _fmt
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary metrics
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Summary metrics ───────────────────────────────────────────────────────────
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<p class="section-title">📈 Comparison Summary</p>', unsafe_allow_html=True)
@@ -1529,9 +1564,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sheet overview pills
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Sheet overview pills ──────────────────────────────────────────────────────
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<p class="section-title">📋 Sheet Overview</p>', unsafe_allow_html=True)
@@ -1567,16 +1600,11 @@ for sname in ordered:
         has_chg = sv.get("changed_cells", 0) + sv.get("added_rows", 0) + sv.get("deleted_rows", 0) > 0
         cls  = "pill pill-modified" if has_chg else "pill pill-unchanged"
         icon = "~" if has_chg else "✓"
-
-    label = f"{icon} {sname}"
-    pills_html.append(f'<span class="{cls}">{_esc(label)}</span>')
-
+    pills_html.append(f'<span class="{cls}">{_esc(f"{icon} {sname}")}</span>')
 pills_html.append("</div>")
 st.markdown("".join(pills_html), unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-sheet analysis tabs
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Per-sheet analysis tabs ───────────────────────────────────────────────────
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<p class="section-title">🔍 Sheet-by-Sheet Analysis</p>', unsafe_allow_html=True)
@@ -1596,26 +1624,18 @@ tabs = st.tabs(tab_labels)
 
 for sname, tab in zip(ordered, tabs):
     with tab:
-
-        # ── New sheet ──────────────────────────────────────────────────────
         if sname in new_only:
-            st.success(
-                f"**'{sname}'** is a **new sheet** — it exists only in the Proposed Pages."
-            )
+            st.success(f"**'{sname}'** is a **new sheet** — it exists only in the Proposed Pages.")
             df = new_sheets[sname]
             st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
             st.dataframe(df, use_container_width=True, height=380, hide_index=True)
 
-        # ── Deleted sheet ──────────────────────────────────────────────────
         elif sname in deleted_only:
-            st.error(
-                f"**'{sname}'** was **deleted** — it exists only in the Current Pages."
-            )
+            st.error(f"**'{sname}'** was **deleted** — it exists only in the Current Pages.")
             df = old_sheets[sname]
             st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
             st.dataframe(df, use_container_width=True, height=380, hide_index=True)
 
-        # ── Common sheet ───────────────────────────────────────────────────
         else:
             old_a, new_a, cell_status, row_status = sheet_data[sname]
             sv = sheet_stats[sname]
@@ -1623,26 +1643,16 @@ for sname, tab in zip(ordered, tabs):
 
             if not has_chg:
                 st.info(f"✅ No changes detected in **'{sname}'**.")
-                st.dataframe(
-                    new_sheets[sname], use_container_width=True,
-                    height=320, hide_index=True,
-                )
+                st.dataframe(new_sheets[sname], use_container_width=True, height=320, hide_index=True)
             else:
-                # Mini metrics
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Rows compared",  f"{sv['total_rows']:,}")
-                m2.metric(
-                    "Added rows", sv["added_rows"],
-                    delta=f"+{sv['added_rows']}" if sv["added_rows"] else None,
-                )
-                m3.metric(
-                    "Deleted rows", sv["deleted_rows"],
-                    delta=f"-{sv['deleted_rows']}" if sv["deleted_rows"] else None,
-                    delta_color="inverse",
-                )
-                m4.metric("Changed cells", f"{sv['changed_cells']:,}")
-
-                # Legend
+                m2.metric("Added rows",     sv["added_rows"],
+                          delta=f"+{sv['added_rows']}" if sv["added_rows"] else None)
+                m3.metric("Deleted rows",   sv["deleted_rows"],
+                          delta=f"-{sv['deleted_rows']}" if sv["deleted_rows"] else None,
+                          delta_color="inverse")
+                m4.metric("Changed cells",  f"{sv['changed_cells']:,}")
                 st.markdown(
                     """
                     <div class="legend" style="margin-top:0.8rem">
@@ -1662,78 +1672,21 @@ for sname, tab in zip(ordered, tabs):
                     """,
                     unsafe_allow_html=True,
                 )
-
                 html = render_diff_table(old_a, new_a, cell_status, row_status)
                 st.markdown(html, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Export section
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Export section ────────────────────────────────────────────────────────────
 
 st.markdown('<hr class="divider">', unsafe_allow_html=True)
 st.markdown('<p class="section-title">💾 Export</p>', unsafe_allow_html=True)
 
-exp_col1, exp_col2 = st.columns(2)
-
-with exp_col1:
-    st.download_button(
-        label="📥 Download Highlighted Excel Report",
-        data=st.session_state.report_bytes,
-        file_name=st.session_state.report_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
-        help="Excel workbook with colour-coded sheet tabs and highlighted cells",
-    )
-
-with exp_col2:
-    # Summary CSV
-    csv_rows = []
-    for sname in ordered:
-        if sname in new_only:
-            csv_rows.append({
-                "Sheet": sname, "Status": "Added",
-                "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0,
-            })
-        elif sname in deleted_only:
-            csv_rows.append({
-                "Sheet": sname, "Status": "Deleted",
-                "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0,
-            })
-        else:
-            sv = sheet_stats[sname]
-            has_chg = sv["changed_cells"] + sv["added_rows"] + sv["deleted_rows"] > 0
-            csv_rows.append({
-                "Sheet":         sname,
-                "Status":        "Modified" if has_chg else "Unchanged",
-                "Changed Cells": sv["changed_cells"],
-                "Added Rows":    sv["added_rows"],
-                "Deleted Rows":  sv["deleted_rows"],
-                "Changed Rows":  sv["changed_rows"],
-            })
-
-    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="📊 Download Summary CSV",
-        data=csv_bytes,
-        file_name=f"diff_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        help="One row per sheet — quick overview of all changes",
-    )
-
+# Tracked Pages download (primary — generated by button)
 if st.session_state.tracked_report_bytes:
-    _tfmt = st.session_state.tracked_fmt or "Side-by-Side"
+    _tfmt   = st.session_state.tracked_fmt or "Side-by-Side"
     _tlabel = (
         "📋 Download Tracked Pages — Side-by-Side"
         if _tfmt == "Side-by-Side"
         else "🔀 Download Tracked Pages — Inline Diff"
-    )
-    _thelp = (
-        "Each sheet: Current Pages on the left, Proposed Pages on the right — "
-        "strikethrough = changed current value, yellow = changed proposed value."
-        if _tfmt == "Side-by-Side"
-        else "Single table per sheet — changed cells show ~~current~~  proposed in one cell."
     )
     st.download_button(
         label=_tlabel,
@@ -1742,11 +1695,41 @@ if st.session_state.tracked_report_bytes:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
         type="primary",
-        help=_thelp,
     )
-else:
-    st.info(
-        "Select **Side-by-Side** or **Inline Diff** above and click "
-        "**⚙️ Generate Tracked Pages** to create the comparison Excel.",
-        icon="ℹ️",
+
+exp_col1, exp_col2 = st.columns(2)
+
+with exp_col1:
+    st.download_button(
+        label="📥 Download Highlighted Excel Report",
+        data=_cd["report_bytes"],
+        file_name=_cd["report_fname"],
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        help="Excel workbook with colour-coded sheet tabs and highlighted cells",
+    )
+
+with exp_col2:
+    csv_rows = []
+    for sname in ordered:
+        if sname in new_only:
+            csv_rows.append({"Sheet": sname, "Status": "Added",
+                             "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0})
+        elif sname in deleted_only:
+            csv_rows.append({"Sheet": sname, "Status": "Deleted",
+                             "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0})
+        else:
+            sv = sheet_stats[sname]
+            has_chg = sv["changed_cells"] + sv["added_rows"] + sv["deleted_rows"] > 0
+            csv_rows.append({"Sheet": sname, "Status": "Modified" if has_chg else "Unchanged",
+                             "Changed Cells": sv["changed_cells"], "Added Rows": sv["added_rows"],
+                             "Deleted Rows": sv["deleted_rows"],   "Changed Rows": sv["changed_rows"]})
+    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="📊 Download Summary CSV",
+        data=csv_bytes,
+        file_name=f"diff_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help="One row per sheet — quick overview of all changes",
     )
