@@ -1697,39 +1697,11 @@ if st.session_state.tracked_report_bytes:
         type="primary",
     )
 
-exp_col1, exp_col2 = st.columns(2)
-
-with exp_col1:
-    st.download_button(
-        label="📥 Download Highlighted Excel Report",
-        data=_cd["report_bytes"],
-        file_name=_cd["report_fname"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        help="Excel workbook with colour-coded sheet tabs and highlighted cells",
-    )
-
-with exp_col2:
-    csv_rows = []
-    for sname in ordered:
-        if sname in new_only:
-            csv_rows.append({"Sheet": sname, "Status": "Added",
-                             "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0})
-        elif sname in deleted_only:
-            csv_rows.append({"Sheet": sname, "Status": "Deleted",
-                             "Changed Cells": 0, "Added Rows": 0, "Deleted Rows": 0, "Changed Rows": 0})
-        else:
-            sv = sheet_stats[sname]
-            has_chg = sv["changed_cells"] + sv["added_rows"] + sv["deleted_rows"] > 0
-            csv_rows.append({"Sheet": sname, "Status": "Modified" if has_chg else "Unchanged",
-                             "Changed Cells": sv["changed_cells"], "Added Rows": sv["added_rows"],
-                             "Deleted Rows": sv["deleted_rows"],   "Changed Rows": sv["changed_rows"]})
-    csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="📊 Download Summary CSV",
-        data=csv_bytes,
-        file_name=f"diff_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        help="One row per sheet — quick overview of all changes",
-    )
+st.download_button(
+    label="📥 Download Highlighted Excel Report",
+    data=_cd["report_bytes"],
+    file_name=_cd["report_fname"],
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+    help="Excel workbook with colour-coded sheet tabs and highlighted cells",
+)
