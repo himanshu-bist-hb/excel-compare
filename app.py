@@ -37,6 +37,44 @@ def _pick_folder() -> str:
     except Exception:
         return ""
 
+
+class LocalFile:
+    """Thin wrapper around a local file path that mimics Streamlit's UploadedFile
+    interface (`.name`, `.size`, `.read()`) so all existing processing code works
+    unchanged when files come from the filesystem instead of the browser uploader."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.name = os.path.basename(path)
+        self.size = os.path.getsize(path)
+
+    def read(self) -> bytes:
+        with open(self.path, "rb") as fh:
+            return fh.read()
+
+
+def _scan_excel_files(folder_path: str) -> List["LocalFile"]:
+    """Return a sorted list of LocalFile objects for every .xlsx / .xls file
+    found directly inside *folder_path* (non-recursive).  Skips Excel temp
+    files (names starting with '~$')."""
+    if not folder_path or not os.path.isdir(folder_path):
+        return []
+    result = []
+    for fname in sorted(os.listdir(folder_path)):
+        if fname.startswith("~$"):
+            continue
+        if fname.lower().endswith((".xlsx", ".xls")):
+            result.append(LocalFile(os.path.join(folder_path, fname)))
+    return result
+
+
+def _folder_sig(folder_path: str) -> str:
+    """Stable signature string for a folder (used to detect when the user
+    picks a different folder so we can clear stale cached results)."""
+    files = _scan_excel_files(folder_path)
+    return f"{folder_path}||" + "|".join(f"{f.name}:{f.size}" for f in files)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1452,6 +1490,10 @@ if "mass_save_dir" not in st.session_state:
     st.session_state.mass_save_dir = None      # actual folder files were saved to
 if "mass_output_path" not in st.session_state:
     st.session_state.mass_output_path = ""
+if "mass_cur_folder" not in st.session_state:
+    st.session_state.mass_cur_folder = ""
+if "mass_prop_folder" not in st.session_state:
+    st.session_state.mass_prop_folder = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1761,22 +1803,60 @@ with _tab_ind:
 
 with _tab_mass:
 
-    # ── Upload rows ───────────────────────────────────────────────────────────
+    # ── Folder pickers ────────────────────────────────────────────────────────
     mass_col1, mass_col2 = st.columns(2)
+
     with mass_col1:
         st.markdown('<span class="upload-label">📂 Current Pages Folder</span>', unsafe_allow_html=True)
-        mass_cur_files = st.file_uploader(
-            "mass_current", type=["xlsx", "xls"], accept_multiple_files=True,
-            key="mass_cur", label_visibility="collapsed",
-            help="Select all Excel files from the Current Pages folder",
-        )
+        _cur_path_col, _cur_browse_col = st.columns([4, 1])
+        with _cur_path_col:
+            _cur_folder_input = st.text_input(
+                "mass_cur_folder_input",
+                value=st.session_state.mass_cur_folder,
+                label_visibility="collapsed",
+                placeholder="Folder path or click Browse →",
+                key="mass_cur_folder_widget",
+            )
+            st.session_state.mass_cur_folder = _cur_folder_input
+        with _cur_browse_col:
+            if st.button("📂", key="mass_cur_browse", help="Browse for Current Pages folder"):
+                _p = _pick_folder()
+                if _p:
+                    st.session_state.mass_cur_folder = _p
+                    st.rerun()
+        # Scan folder
+        mass_cur_files = _scan_excel_files(st.session_state.mass_cur_folder.strip().strip('"').strip("'"))
+        if st.session_state.mass_cur_folder.strip():
+            if mass_cur_files:
+                st.caption(f"✅ {len(mass_cur_files)} Excel file(s) found")
+            else:
+                st.caption("⚠️ No Excel files found in this folder")
+
     with mass_col2:
         st.markdown('<span class="upload-label">📂 Proposed Pages Folder</span>', unsafe_allow_html=True)
-        mass_prop_files = st.file_uploader(
-            "mass_proposed", type=["xlsx", "xls"], accept_multiple_files=True,
-            key="mass_prop", label_visibility="collapsed",
-            help="Select all Excel files from the Proposed Pages folder",
-        )
+        _prop_path_col, _prop_browse_col = st.columns([4, 1])
+        with _prop_path_col:
+            _prop_folder_input = st.text_input(
+                "mass_prop_folder_input",
+                value=st.session_state.mass_prop_folder,
+                label_visibility="collapsed",
+                placeholder="Folder path or click Browse →",
+                key="mass_prop_folder_widget",
+            )
+            st.session_state.mass_prop_folder = _prop_folder_input
+        with _prop_browse_col:
+            if st.button("📂", key="mass_prop_browse", help="Browse for Proposed Pages folder"):
+                _p = _pick_folder()
+                if _p:
+                    st.session_state.mass_prop_folder = _p
+                    st.rerun()
+        # Scan folder
+        mass_prop_files = _scan_excel_files(st.session_state.mass_prop_folder.strip().strip('"').strip("'"))
+        if st.session_state.mass_prop_folder.strip():
+            if mass_prop_files:
+                st.caption(f"✅ {len(mass_prop_files)} Excel file(s) found")
+            else:
+                st.caption("⚠️ No Excel files found in this folder")
 
     # ── Output save location ──────────────────────────────────────────────────
     st.markdown(
@@ -1845,7 +1925,7 @@ with _tab_mass:
             use_container_width=True,
             key="mass_generate_btn",
             disabled=not (mass_cur_files and mass_prop_files),
-            help="Upload files from both folders, then click to batch-generate all Tracked Pages",
+            help="Select both folders first, then click to batch-generate all Tracked Pages",
         )
 
     # ── Instructions ──────────────────────────────────────────────────────────
@@ -1855,20 +1935,23 @@ with _tab_mass:
             <div class="info-box">
               <strong>How to use — Mass Processing mode</strong>
               <ol>
-                <li>Click <strong>Current Pages Folder</strong> and select <em>all</em> Excel files
-                    from your current pages folder (Ctrl+A or Cmd+A to select all).</li>
-                <li>Click <strong>Proposed Pages Folder</strong> and select <em>all</em> Excel files
-                    from your proposed pages folder.</li>
-                <li>Files are matched automatically by name — the only difference allowed is the
-                    <strong>date</strong> portion (format <code>DD-MM-YYYY</code> anywhere in the
-                    filename, e.g. <em>Report 01-11-2025 Final.xlsx</em> matches
-                    <em>Report 15-03-2026 Final.xlsx</em>).</li>
-                <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong>.</li>
-                <li>Click <strong>⚙️ Generate All Tracked Pages</strong> — a ZIP containing one
-                    Tracked Pages Excel per matched pair is produced for download.</li>
+                <li>Click <strong>📂 Browse</strong> next to <em>Current Pages Folder</em> and
+                    select the folder that contains all your current Excel files — every
+                    <code>.xlsx</code> / <code>.xls</code> file in that folder is picked up
+                    automatically.</li>
+                <li>Click <strong>📂 Browse</strong> next to <em>Proposed Pages Folder</em> and
+                    select the folder with the proposed Excel files.</li>
+                <li>Files are matched automatically — the only difference allowed in the name is
+                    the <strong>date</strong> portion (format <code>DD-MM-YYYY</code>), e.g.
+                    <em>Report 01-11-2025 Final.xlsx</em> matches
+                    <em>Report 15-03-2026 Final.xlsx</em>.</li>
+                <li>Set an <strong>Output Save Location</strong> (optional) — files are also
+                    saved directly to a <em>Tracked Pages</em> sub-folder there.</li>
+                <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong> and
+                    click <strong>⚙️ Generate All Tracked Pages</strong>.</li>
               </ol>
-              <strong>Output file naming:</strong> each output file is named after the
-              Proposed Pages file with <em>" - TRACKED PAGES"</em> appended, e.g.
+              <strong>Output file naming:</strong> each file is named after the Proposed Pages
+              file with <em>" - TRACKED PAGES"</em> appended, e.g.
               <em>Report 15-03-2026 Final - TRACKED PAGES.xlsx</em>.
             </div>
             """,
@@ -1876,9 +1959,10 @@ with _tab_mass:
         )
     else:
         # Detect folder changes — clear stale mass results
-        _mass_cur_fid  = "|".join(sorted(f"{f.name}:{f.size}" for f in mass_cur_files))
-        _mass_prop_fid = "|".join(sorted(f"{f.name}:{f.size}" for f in mass_prop_files))
-        _mass_fids     = (_mass_cur_fid, _mass_prop_fid)
+        _mass_fids = (
+            _folder_sig(st.session_state.mass_cur_folder.strip().strip('"').strip("'")),
+            _folder_sig(st.session_state.mass_prop_folder.strip().strip('"').strip("'")),
+        )
         if st.session_state.mass_file_ids != _mass_fids:
             st.session_state.mass_results   = None
             st.session_state.mass_zip_bytes = None
