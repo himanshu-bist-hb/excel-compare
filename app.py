@@ -1800,19 +1800,17 @@ with _tab_mass:
     )
     path_col, browse_col = st.columns([4, 1])
     with path_col:
-        _mass_out_path = st.text_input(
+        # Key IS the session-state key — so st.rerun() after Browse shows the picked path
+        st.text_input(
             "mass_output_path_input",
-            value=st.session_state.mass_output_path,
             label_visibility="collapsed",
-            placeholder='Paste or browse to a folder, e.g.  C:\\Users\\You\\Desktop',
+            placeholder='Paste a folder path or click Browse  →  e.g.  C:\\Users\\You\\Desktop',
             help=(
                 "Files will be saved to a 'Tracked Pages' subfolder here.\n"
                 "Tip (Windows): right-click a folder in Explorer → Copy as path → paste above."
             ),
-            key="mass_output_path_widget",
+            key="mass_output_path",
         )
-        # Sync widget value back to session state
-        st.session_state.mass_output_path = _mass_out_path
     with browse_col:
         if st.button("📂 Browse", key="mass_browse_btn", use_container_width=True,
                      help="Open a folder picker dialog (local use only)"):
@@ -1941,33 +1939,44 @@ with _tab_mass:
 
                 mass_results_list = []
                 zip_buf = io.BytesIO()
+                total_pairs = len(matched_pairs)
 
-                progress_bar = st.progress(0, text="Starting…")
-                total_pairs  = len(matched_pairs)
+                with st.status(
+                    f"⚙️ Generating {total_pairs} Tracked Page(s)…",
+                    expanded=True,
+                ) as _status:
+                    progress_bar = st.progress(0, text="Initialising…")
 
-                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                    for idx, (cur_f, prop_f) in enumerate(matched_pairs):
-                        progress_bar.progress(
-                            idx / total_pairs,
-                            text=f"Processing {idx + 1}/{total_pairs}: {prop_f.name}",
-                        )
-                        tracked_bytes, stats = _process_file_pair(cur_f, prop_f, _mfmt)
-                        mass_results_list.append(stats)
-                        if tracked_bytes:
-                            stem      = os.path.splitext(prop_f.name)[0]
-                            out_fname = f"{stem} - TRACKED PAGES.xlsx"
-                            # Add to ZIP
-                            zf.writestr(out_fname, tracked_bytes)
-                            # Save directly to disk (overwrite if exists)
-                            if _disk_dir:
-                                try:
-                                    disk_path = os.path.join(_disk_dir, out_fname)
-                                    with open(disk_path, "wb") as fh:
-                                        fh.write(tracked_bytes)
-                                except Exception as _write_err:
-                                    stats["save_error"] = str(_write_err)
+                    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                        for idx, (cur_f, prop_f) in enumerate(matched_pairs):
+                            pct_label = f"**[{idx + 1}/{total_pairs}]** Processing `{prop_f.name}`…"
+                            st.write(pct_label)
+                            progress_bar.progress(
+                                idx / total_pairs,
+                                text=f"Processing {idx + 1} of {total_pairs}: {prop_f.name}",
+                            )
+                            tracked_bytes, stats = _process_file_pair(cur_f, prop_f, _mfmt)
+                            mass_results_list.append(stats)
+                            if tracked_bytes:
+                                stem      = os.path.splitext(prop_f.name)[0]
+                                out_fname = f"{stem} - TRACKED PAGES.xlsx"
+                                # Add to ZIP
+                                zf.writestr(out_fname, tracked_bytes)
+                                # Save directly to disk (overwrite if exists)
+                                if _disk_dir:
+                                    try:
+                                        disk_path = os.path.join(_disk_dir, out_fname)
+                                        with open(disk_path, "wb") as fh:
+                                            fh.write(tracked_bytes)
+                                    except Exception as _write_err:
+                                        stats["save_error"] = str(_write_err)
 
-                progress_bar.progress(1.0, text=f"Done — {total_pairs} file(s) processed.")
+                    progress_bar.progress(1.0, text=f"✅ Done — {total_pairs} file(s) processed.")
+                    _status.update(
+                        label=f"✅ Complete — {total_pairs} file(s) processed.",
+                        state="complete",
+                        expanded=False,
+                    )
 
                 st.session_state.mass_results   = mass_results_list
                 st.session_state.mass_zip_bytes = zip_buf.getvalue()
