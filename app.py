@@ -20,6 +20,23 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 from openpyxl.worksheet.properties import PageSetupProperties
 
+
+def _pick_folder() -> str:
+    """Open a native OS folder-picker dialog and return the chosen path.
+    Works when Streamlit is running locally (not in a cloud deployment).
+    Returns an empty string if the user cancels or tkinter is unavailable."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        folder = filedialog.askdirectory(title="Select output folder", master=root)
+        root.destroy()
+        return folder or ""
+    except Exception:
+        return ""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Page Config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1431,6 +1448,10 @@ if "mass_file_ids" not in st.session_state:
     st.session_state.mass_file_ids = (None, None)
 if "mass_fmt" not in st.session_state:
     st.session_state.mass_fmt = None
+if "mass_save_dir" not in st.session_state:
+    st.session_state.mass_save_dir = None      # actual folder files were saved to
+if "mass_output_path" not in st.session_state:
+    st.session_state.mass_output_path = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1757,6 +1778,47 @@ with _tab_mass:
             help="Select all Excel files from the Proposed Pages folder",
         )
 
+    # ── Output save location ──────────────────────────────────────────────────
+    st.markdown(
+        '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
+        '💾 Output Save Location</p>',
+        unsafe_allow_html=True,
+    )
+    path_col, browse_col = st.columns([4, 1])
+    with path_col:
+        _mass_out_path = st.text_input(
+            "mass_output_path_input",
+            value=st.session_state.mass_output_path,
+            label_visibility="collapsed",
+            placeholder='Paste or browse to a folder, e.g.  C:\\Users\\You\\Desktop',
+            help=(
+                "Files will be saved to a 'Tracked Pages' subfolder here.\n"
+                "Tip (Windows): right-click a folder in Explorer → Copy as path → paste above."
+            ),
+            key="mass_output_path_widget",
+        )
+        # Sync widget value back to session state
+        st.session_state.mass_output_path = _mass_out_path
+    with browse_col:
+        if st.button("📂 Browse", key="mass_browse_btn", use_container_width=True,
+                     help="Open a folder picker dialog (local use only)"):
+            _picked = _pick_folder()
+            if _picked:
+                st.session_state.mass_output_path = _picked
+                st.rerun()
+
+    # Validate path and show resolved save folder
+    _raw_path = st.session_state.mass_output_path.strip().strip('"').strip("'")
+    if _raw_path:
+        _resolved_save_dir = os.path.join(_raw_path, "Tracked Pages")
+        if os.path.isdir(_raw_path):
+            st.caption(f"✅ Files will be saved to: `{_resolved_save_dir}`")
+        else:
+            st.caption(f"⚠️ Folder not found: `{_raw_path}` — it will be created on Generate.")
+    else:
+        _resolved_save_dir = None
+        st.caption("ℹ️ No save location set — files will only be available as a ZIP download.")
+
     # ── Format selector + Generate button ────────────────────────────────────
     st.markdown(
         '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
@@ -1851,6 +1913,17 @@ with _tab_mass:
                 _mfmt = st.session_state.get("mass_export_fmt", "Side-by-Side")
                 ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+                # Prepare output folder on disk (if path provided)
+                _out_base = st.session_state.mass_output_path.strip().strip('"').strip("'")
+                _disk_dir: Optional[str] = None
+                if _out_base:
+                    _disk_dir = os.path.join(_out_base, "Tracked Pages")
+                    try:
+                        os.makedirs(_disk_dir, exist_ok=True)
+                    except Exception as _mkdir_err:
+                        st.error(f"Could not create output folder: {_mkdir_err}")
+                        _disk_dir = None
+
                 mass_results_list = []
                 zip_buf = io.BytesIO()
 
@@ -1866,9 +1939,18 @@ with _tab_mass:
                         tracked_bytes, stats = _process_file_pair(cur_f, prop_f, _mfmt)
                         mass_results_list.append(stats)
                         if tracked_bytes:
-                            stem       = os.path.splitext(prop_f.name)[0]
-                            out_fname  = f"{stem} - TRACKED PAGES.xlsx"
+                            stem      = os.path.splitext(prop_f.name)[0]
+                            out_fname = f"{stem} - TRACKED PAGES.xlsx"
+                            # Add to ZIP
                             zf.writestr(out_fname, tracked_bytes)
+                            # Save directly to disk (overwrite if exists)
+                            if _disk_dir:
+                                try:
+                                    disk_path = os.path.join(_disk_dir, out_fname)
+                                    with open(disk_path, "wb") as fh:
+                                        fh.write(tracked_bytes)
+                                except Exception as _write_err:
+                                    stats["save_error"] = str(_write_err)
 
                 progress_bar.progress(1.0, text=f"Done — {total_pairs} file(s) processed.")
 
@@ -1876,6 +1958,7 @@ with _tab_mass:
                 st.session_state.mass_zip_bytes = zip_buf.getvalue()
                 st.session_state.mass_fmt       = _mfmt
                 st.session_state.mass_file_ids  = _mass_fids
+                st.session_state.mass_save_dir  = _disk_dir
 
             # ── Render mass results ───────────────────────────────────────────
             _mr = st.session_state.mass_results
@@ -1955,9 +2038,26 @@ with _tab_mass:
                 if err_results:
                     st.error(f"{len(err_results)} file(s) failed to process — see Status column above.")
 
-                # ── Download ZIP ──────────────────────────────────────────────
+                # ── Save location status ──────────────────────────────────────
+                _saved_dir = st.session_state.mass_save_dir
+                save_errors = [r for r in ok_results if r.get("save_error")]
+
                 st.markdown('<hr class="divider">', unsafe_allow_html=True)
-                st.markdown('<p class="section-title">💾 Download</p>', unsafe_allow_html=True)
+                st.markdown('<p class="section-title">💾 Output</p>', unsafe_allow_html=True)
+
+                if _saved_dir:
+                    saved_count = len(ok_results) - len(save_errors)
+                    st.success(
+                        f"**{saved_count} file(s) saved** to `{_saved_dir}`",
+                        icon="✅",
+                    )
+                    if save_errors:
+                        with st.expander(f"⚠️ {len(save_errors)} file(s) could not be saved to disk"):
+                            for r in save_errors:
+                                st.markdown(f"• `{r.get('proposed_file','?')}` — {r['save_error']}")
+                else:
+                    st.info("No save location was set — files are available as ZIP download only.", icon="ℹ️")
+
                 _mfmt_label = st.session_state.get("mass_fmt", "Side-by-Side")
                 st.download_button(
                     label=f"📦 Download All Tracked Pages (ZIP) — {_mfmt_label}",
