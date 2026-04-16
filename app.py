@@ -5,10 +5,11 @@ A professional Streamlit app to compare two Excel files at sheet and cell level.
 
 import copy
 import io
+import os
 import re
 import zipfile
 from datetime import datetime
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import openpyxl
@@ -301,6 +302,130 @@ def compare_dataframes(
         "changed_rows":  changed_rows,
         "changed_cells": changed_cells,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mass-processing helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DATE_RE = re.compile(r"\b\d{2}-\d{2}-\d{4}\b")
+
+
+def _base_name(filename: str) -> str:
+    """
+    Strip the date (DD-MM-YYYY) and file extension from *filename*, then
+    normalise whitespace so files that differ only by date compare equal.
+    """
+    stem = os.path.splitext(filename)[0]
+    cleaned = _DATE_RE.sub("", stem)
+    cleaned = re.sub(r"[\s_\-]+", " ", cleaned).strip().lower()
+    return cleaned
+
+
+def _match_file_pairs(
+    current_files: list, proposed_files: list
+) -> Tuple[List[Tuple], List, List]:
+    """
+    Match uploaded files from the current and proposed folders by base name
+    (name with date stripped).
+
+    Returns
+    -------
+    matched  : list of (current_file, proposed_file) tuples
+    unmatched_current  : files in current with no proposed counterpart
+    unmatched_proposed : files in proposed with no current counterpart
+    """
+    cur_map:  Dict[str, object] = {}
+    prop_map: Dict[str, object] = {}
+
+    for f in current_files:
+        key = _base_name(f.name)
+        cur_map[key] = f
+
+    for f in proposed_files:
+        key = _base_name(f.name)
+        prop_map[key] = f
+
+    matched            = [(cur_map[k], prop_map[k]) for k in cur_map if k in prop_map]
+    unmatched_current  = [cur_map[k]  for k in cur_map  if k not in prop_map]
+    unmatched_proposed = [prop_map[k] for k in prop_map if k not in cur_map]
+
+    return matched, unmatched_current, unmatched_proposed
+
+
+def _process_file_pair(
+    old_f, new_f, fmt: str
+) -> Tuple[Optional[bytes], dict]:
+    """
+    Read, compare and build the Tracked Pages Excel for one file pair.
+
+    Returns (tracked_bytes, stats_dict).  On error tracked_bytes is None
+    and stats_dict contains an 'error' key with the message.
+    """
+    try:
+        old_raw    = _file_bytes(old_f)
+        new_raw    = _file_bytes(new_f)
+        old_sheets = read_excel_sheets(old_raw, old_f.name)
+        new_sheets = read_excel_sheets(new_raw, new_f.name)
+
+        if not old_sheets or not new_sheets:
+            return None, {"error": "Could not read one or both files"}
+
+        old_names_s: Set[str] = set(old_sheets)
+        new_names_s: Set[str] = set(new_sheets)
+        new_only_s     = new_names_s - old_names_s
+        deleted_only_s = old_names_s - new_names_s
+        common_s       = old_names_s & new_names_s
+        ordered_s      = list(old_sheets.keys()) + [
+            s for s in new_sheets.keys() if s not in old_sheets
+        ]
+
+        sheet_stats_s: Dict[str, dict]  = {}
+        sheet_data_s:  Dict[str, tuple] = {}
+        for sname in common_s:
+            oa, na, cs, rs, stats = compare_dataframes(
+                old_sheets[sname], new_sheets[sname]
+            )
+            sheet_stats_s[sname] = stats
+            sheet_data_s[sname]  = (oa, na, cs, rs)
+
+        if fmt == "Side-by-Side":
+            tracked = build_sidebyside_excel(
+                old_sheets, new_sheets, new_only_s, deleted_only_s,
+                sheet_stats_s, sheet_data_s, old_f.name, new_f.name,
+                old_raw, new_raw,
+            )
+        else:
+            tracked = build_inline_excel(
+                old_sheets, new_sheets, new_only_s, deleted_only_s,
+                sheet_stats_s, sheet_data_s, old_f.name, new_f.name,
+                old_raw, new_raw,
+            )
+
+        total_chg = sum(
+            v["changed_cells"] + v["added_rows"] + v["deleted_rows"]
+            for v in sheet_stats_s.values()
+        )
+        modified_s = sum(
+            1 for v in sheet_stats_s.values()
+            if v["changed_cells"] + v["added_rows"] + v["deleted_rows"] > 0
+        )
+        return tracked, {
+            "error":            None,
+            "current_file":     old_f.name,
+            "proposed_file":    new_f.name,
+            "total_sheets":     len(old_names_s | new_names_s),
+            "new_sheets":       len(new_only_s),
+            "deleted_sheets":   len(deleted_only_s),
+            "modified_sheets":  modified_s,
+            "unchanged_sheets": len(common_s) - modified_s,
+            "changed_cells":    sum(v["changed_cells"] for v in sheet_stats_s.values()),
+            "added_rows":       sum(v["added_rows"]    for v in sheet_stats_s.values()),
+            "deleted_rows":     sum(v["deleted_rows"]  for v in sheet_stats_s.values()),
+            "total_changes":    total_chg,
+        }
+    except Exception as exc:
+        return None, {"error": str(exc), "current_file": old_f.name, "proposed_file": new_f.name}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1285,8 +1410,9 @@ def build_inline_excel(
 # Session-state initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Individual mode
 if "comp_data" not in st.session_state:
-    st.session_state.comp_data = None          # dict of all analysis results
+    st.session_state.comp_data = None
 if "comp_file_ids" not in st.session_state:
     st.session_state.comp_file_ids = (None, None)
 if "tracked_report_bytes" not in st.session_state:
@@ -1296,412 +1422,549 @@ if "tracked_report_filename" not in st.session_state:
 if "tracked_fmt" not in st.session_state:
     st.session_state.tracked_fmt = None
 
+# Mass mode
+if "mass_results" not in st.session_state:
+    st.session_state.mass_results = None       # list of per-file stat dicts
+if "mass_zip_bytes" not in st.session_state:
+    st.session_state.mass_zip_bytes = None
+if "mass_file_ids" not in st.session_state:
+    st.session_state.mass_file_ids = (None, None)
+if "mass_fmt" not in st.session_state:
+    st.session_state.mass_fmt = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UI — Header
+# UI — Header + Mode Tabs
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.markdown(
     """
     <div class="hero">
       <h1>📊 Excel Comparator Pro</h1>
-      <p>Upload two Excel workbooks — get instant, cell-level diff across every sheet</p>
+      <p>Compare Excel workbooks — individual files or an entire folder at once</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# ── Upload row ────────────────────────────────────────────────────────────────
-up_col1, up_col2 = st.columns(2)
+_tab_ind, _tab_mass = st.tabs(["📄  Individual Pages", "📁  Mass Processing"])
 
-with up_col1:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — INDIVIDUAL PAGES
+# ══════════════════════════════════════════════════════════════════════════════
+
+with _tab_ind:
+
+    # ── Upload row ────────────────────────────────────────────────────────────
+    up_col1, up_col2 = st.columns(2)
+    with up_col1:
+        st.markdown('<span class="upload-label">📁 Current Pages</span>', unsafe_allow_html=True)
+        old_file = st.file_uploader(
+            "old_upload", type=["xlsx", "xls"], key="old_file",
+            label_visibility="collapsed", help="The existing / current version of the pages",
+        )
+    with up_col2:
+        st.markdown('<span class="upload-label">📁 Proposed Pages</span>', unsafe_allow_html=True)
+        new_file = st.file_uploader(
+            "new_upload", type=["xlsx", "xls"], key="new_file",
+            label_visibility="collapsed", help="The proposed / updated version of the pages",
+        )
+
+    # ── Format selector + Generate button ────────────────────────────────────
     st.markdown(
-        '<span class="upload-label">📁 Current Pages</span>',
+        '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
+        '🔧 Tracked Pages format</p>',
         unsafe_allow_html=True,
     )
-    old_file = st.file_uploader(
-        "old_upload",
-        type=["xlsx", "xls"],
-        key="old_file",
-        label_visibility="collapsed",
-        help="The existing / current version of the pages",
-    )
+    fmt_col, btn_col = st.columns([2, 1])
+    with fmt_col:
+        st.radio(
+            "export_format_selector",
+            options=["Side-by-Side", "Inline Diff"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="export_fmt",
+            help=(
+                "Side-by-Side: Current Pages on the left, Proposed Pages on the right.\n"
+                "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
+            ),
+        )
+    with btn_col:
+        _ind_generate = st.button(
+            "⚙️ Generate Tracked Pages",
+            type="primary",
+            use_container_width=True,
+            key="ind_generate_btn",
+            disabled=not (old_file and new_file),
+            help="Upload both files first, then click to create the Tracked Pages Excel",
+        )
 
-with up_col2:
-    st.markdown(
-        '<span class="upload-label">📁 Proposed Pages</span>',
-        unsafe_allow_html=True,
-    )
-    new_file = st.file_uploader(
-        "new_upload",
-        type=["xlsx", "xls"],
-        key="new_file",
-        label_visibility="collapsed",
-        help="The proposed / updated version of the pages",
-    )
-
-# ── Format selector + Generate button ────────────────────────────────────────
-st.markdown(
-    '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
-    '🔧 Tracked Pages format</p>',
-    unsafe_allow_html=True,
-)
-fmt_col, btn_col = st.columns([2, 1])
-with fmt_col:
-    st.radio(
-        "export_format_selector",
-        options=["Side-by-Side", "Inline Diff"],
-        horizontal=True,
-        label_visibility="collapsed",
-        key="export_fmt",
-        help=(
-            "Side-by-Side: Current Pages on the left, Proposed Pages on the right.\n"
-            "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
-        ),
-    )
-with btn_col:
-    _generate_clicked = st.button(
-        "⚙️ Generate Tracked Pages",
-        type="primary",
-        use_container_width=True,
-        disabled=not (old_file and new_file),
-        help="Upload both files first, then click to create the Tracked Pages Excel",
-    )
-
-# ── Instructions (shown only while files are missing) ────────────────────────
-if not old_file or not new_file:
-    st.markdown(
-        """
-        <div class="info-box">
-          <strong>How to use Excel Comparator Pro</strong>
-          <ol>
-            <li>Upload your <strong>Current Pages</strong> Excel file on the left.</li>
-            <li>Upload your <strong>Proposed Pages</strong> Excel file on the right.</li>
-            <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong> format.</li>
-            <li>Click <strong>Generate Tracked Pages</strong> to create the comparison Excel.</li>
-          </ol>
-          <strong>What is detected:</strong>
-          <ul>
-            <li>🟢 <strong>New sheets</strong> — sheet added in the Proposed Pages</li>
-            <li>🔴 <strong>Deleted sheets</strong> — sheet removed from the Current Pages</li>
-            <li>🟡 <strong>Changed cells</strong> — yellow highlight with old ↦ new value</li>
-            <li>🟢 <strong>Added rows</strong> — full row highlighted green</li>
-            <li>🔴 <strong>Deleted rows</strong> — full row highlighted red</li>
-          </ul>
-          Download the <strong>Tracked Pages Excel</strong> with colour-coded tabs and cells.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.stop()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Detect file pair changes — clear stale results without reading files
-# ─────────────────────────────────────────────────────────────────────────────
-
-_old_fid = f"{old_file.name}:{old_file.size}"
-_new_fid = f"{new_file.name}:{new_file.size}"
-_cur_fids = (_old_fid, _new_fid)
-
-if st.session_state.comp_file_ids != _cur_fids:
-    # New files uploaded — clear everything so stale results are never shown
-    st.session_state.comp_data              = None
-    st.session_state.tracked_report_bytes   = None
-    st.session_state.tracked_report_filename= None
-    st.session_state.tracked_fmt            = None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Generate Tracked Pages — ALL processing happens here on button click
-# ─────────────────────────────────────────────────────────────────────────────
-
-if _generate_clicked:
-    _fmt = st.session_state.get("export_fmt", "Side-by-Side")
-    ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-
-    with st.spinner("Reading workbooks…"):
-        old_raw    = _file_bytes(old_file)
-        new_raw    = _file_bytes(new_file)
-        old_sheets = read_excel_sheets(old_raw, old_file.name)
-        new_sheets = read_excel_sheets(new_raw, new_file.name)
-
-    if old_sheets and new_sheets:
-        old_names_g: Set[str] = set(old_sheets)
-        new_names_g: Set[str] = set(new_sheets)
-        new_only_g     = new_names_g - old_names_g
-        deleted_only_g = old_names_g - new_names_g
-        common_g       = old_names_g & new_names_g
-        ordered_g: List[str] = list(old_sheets.keys()) + [
-            s for s in new_sheets.keys() if s not in old_sheets
-        ]
-
-        with st.spinner("Computing differences…"):
-            sheet_stats_g: Dict[str, dict] = {}
-            sheet_data_g:  Dict[str, tuple] = {}
-            for sname in common_g:
-                old_a, new_a, cs, rs, stats = compare_dataframes(
-                    old_sheets[sname], new_sheets[sname]
-                )
-                sheet_stats_g[sname] = stats
-                sheet_data_g[sname]  = (old_a, new_a, cs, rs)
-
-        if _fmt == "Side-by-Side":
-            with st.spinner("Generating Tracked Pages (Side-by-Side)…"):
-                tracked_bytes = build_sidebyside_excel(
-                    old_sheets, new_sheets, new_only_g, deleted_only_g,
-                    sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
-                    old_raw, new_raw,
-                )
-                tracked_fname = f"tracked_pages_sidebyside_{ts}.xlsx"
-        else:
-            with st.spinner("Generating Tracked Pages (Inline Diff)…"):
-                tracked_bytes = build_inline_excel(
-                    old_sheets, new_sheets, new_only_g, deleted_only_g,
-                    sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
-                    old_raw, new_raw,
-                )
-                tracked_fname = f"tracked_pages_inline_{ts}.xlsx"
-
-        with st.spinner("Building highlighted summary report…"):
-            report_bytes = build_highlighted_excel(
-                old_sheets, new_sheets, ordered_g, new_only_g, deleted_only_g,
-                sheet_stats_g, old_file.name, new_file.name,
-            )
-            report_fname = f"excel_diff_{ts}.xlsx"
-
-        # Persist all results in session state
-        st.session_state.comp_data = {
-            "old_sheets":   old_sheets,
-            "new_sheets":   new_sheets,
-            "ordered":      ordered_g,
-            "new_only":     new_only_g,
-            "deleted_only": deleted_only_g,
-            "common":       common_g,
-            "sheet_stats":  sheet_stats_g,
-            "sheet_data":   sheet_data_g,
-            "old_name":     old_file.name,
-            "new_name":     new_file.name,
-            "report_bytes": report_bytes,
-            "report_fname": report_fname,
-        }
-        st.session_state.tracked_report_bytes    = tracked_bytes
-        st.session_state.tracked_report_filename = tracked_fname
-        st.session_state.tracked_fmt             = _fmt
-        st.session_state.comp_file_ids           = _cur_fids
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Render analysis + downloads (only after generation)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_cd = st.session_state.comp_data
-
-if _cd is None:
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-    st.info(
-        "Both files are uploaded. Choose **Side-by-Side** or **Inline Diff** above "
-        "and click **⚙️ Generate Tracked Pages** to run the comparison.",
-        icon="ℹ️",
-    )
-    st.stop()
-
-# Unpack stored results
-old_sheets   = _cd["old_sheets"]
-new_sheets   = _cd["new_sheets"]
-ordered      = _cd["ordered"]
-new_only     = _cd["new_only"]
-deleted_only = _cd["deleted_only"]
-common       = _cd["common"]
-sheet_stats  = _cd["sheet_stats"]
-sheet_data   = _cd["sheet_data"]
-
-old_names = set(old_sheets)
-new_names = set(new_sheets)
-
-total_changes = sum(
-    v["changed_cells"] + v["added_rows"] + v["deleted_rows"]
-    for v in sheet_stats.values()
-)
-modified_count = sum(
-    1 for v in sheet_stats.values()
-    if v["changed_cells"] + v["added_rows"] + v["deleted_rows"] > 0
-)
-
-# ── Summary metrics ───────────────────────────────────────────────────────────
-
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown('<p class="section-title">📈 Comparison Summary</p>', unsafe_allow_html=True)
-
-total_sheets_seen = len(old_names | new_names)
-
-st.markdown(
-    f"""
-    <div class="metric-grid">
-      <div class="metric-card">
-        <div class="metric-value" style="color:#0f2942">{total_sheets_seen}</div>
-        <div class="metric-label">Total Sheets</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value" style="color:#10b981">{len(new_only)}</div>
-        <div class="metric-label">Added Sheets</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value" style="color:#ef4444">{len(deleted_only)}</div>
-        <div class="metric-label">Deleted Sheets</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value" style="color:#f59e0b">{modified_count}</div>
-        <div class="metric-label">Modified Sheets</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value" style="color:#6366f1">{len(common) - modified_count}</div>
-        <div class="metric-label">Unchanged Sheets</div>
-      </div>
-      <div class="metric-card">
-        <div class="metric-value" style="color:#dc2626">{total_changes:,}</div>
-        <div class="metric-label">Total Changes</div>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ── Sheet overview pills ──────────────────────────────────────────────────────
-
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown('<p class="section-title">📋 Sheet Overview</p>', unsafe_allow_html=True)
-
-st.markdown(
-    """
-    <div class="legend">
-      <div class="legend-item">
-        <div class="legend-dot" style="background:#10b981"></div>New sheet
-      </div>
-      <div class="legend-item">
-        <div class="legend-dot" style="background:#ef4444"></div>Deleted sheet
-      </div>
-      <div class="legend-item">
-        <div class="legend-dot" style="background:#f59e0b"></div>Modified sheet
-      </div>
-      <div class="legend-item">
-        <div class="legend-dot" style="background:#c5cdd8"></div>Unchanged sheet
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-pills_html = ['<div class="sheet-pills">']
-for sname in ordered:
-    if sname in new_only:
-        cls, icon = "pill pill-new", "＋"
-    elif sname in deleted_only:
-        cls, icon = "pill pill-deleted", "−"
+    # ── Instructions ─────────────────────────────────────────────────────────
+    if not old_file or not new_file:
+        st.markdown(
+            """
+            <div class="info-box">
+              <strong>How to use — Individual mode</strong>
+              <ol>
+                <li>Upload your <strong>Current Pages</strong> Excel on the left.</li>
+                <li>Upload your <strong>Proposed Pages</strong> Excel on the right.</li>
+                <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong>.</li>
+                <li>Click <strong>⚙️ Generate Tracked Pages</strong>.</li>
+              </ol>
+              <strong>What is detected:</strong>
+              <ul>
+                <li>🟢 <strong>New sheets</strong> — added in Proposed Pages</li>
+                <li>🔴 <strong>Deleted sheets</strong> — removed from Current Pages</li>
+                <li>🟡 <strong>Changed cells</strong> — old ↦ new value</li>
+                <li>🟢 <strong>Added rows</strong> &nbsp;🔴 <strong>Deleted rows</strong></li>
+              </ul>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     else:
-        sv = sheet_stats.get(sname, {})
-        has_chg = sv.get("changed_cells", 0) + sv.get("added_rows", 0) + sv.get("deleted_rows", 0) > 0
-        cls  = "pill pill-modified" if has_chg else "pill pill-unchanged"
-        icon = "~" if has_chg else "✓"
-    pills_html.append(f'<span class="{cls}">{_esc(f"{icon} {sname}")}</span>')
-pills_html.append("</div>")
-st.markdown("".join(pills_html), unsafe_allow_html=True)
+        # Detect file pair changes — clear stale results
+        _old_fid  = f"{old_file.name}:{old_file.size}"
+        _new_fid  = f"{new_file.name}:{new_file.size}"
+        _cur_fids = (_old_fid, _new_fid)
+        if st.session_state.comp_file_ids != _cur_fids:
+            st.session_state.comp_data              = None
+            st.session_state.tracked_report_bytes   = None
+            st.session_state.tracked_report_filename= None
+            st.session_state.tracked_fmt            = None
 
-# ── Per-sheet analysis tabs ───────────────────────────────────────────────────
+        # ── Generate on button click ──────────────────────────────────────────
+        if _ind_generate:
+            _fmt = st.session_state.get("export_fmt", "Side-by-Side")
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown('<p class="section-title">🔍 Sheet-by-Sheet Analysis</p>', unsafe_allow_html=True)
+            with st.spinner("Reading workbooks…"):
+                old_raw    = _file_bytes(old_file)
+                new_raw    = _file_bytes(new_file)
+                old_sheets = read_excel_sheets(old_raw, old_file.name)
+                new_sheets = read_excel_sheets(new_raw, new_file.name)
 
-tab_labels: List[str] = []
-for sname in ordered:
-    if sname in new_only:
-        tab_labels.append(f"🟢 {sname}")
-    elif sname in deleted_only:
-        tab_labels.append(f"🔴 {sname}")
-    else:
-        sv = sheet_stats.get(sname, {})
-        has_chg = sv.get("changed_cells", 0) + sv.get("added_rows", 0) + sv.get("deleted_rows", 0) > 0
-        tab_labels.append(f"🟡 {sname}" if has_chg else f"⚪ {sname}")
+            if old_sheets and new_sheets:
+                old_names_g: Set[str] = set(old_sheets)
+                new_names_g: Set[str] = set(new_sheets)
+                new_only_g     = new_names_g - old_names_g
+                deleted_only_g = old_names_g - new_names_g
+                common_g       = old_names_g & new_names_g
+                ordered_g: List[str] = list(old_sheets.keys()) + [
+                    s for s in new_sheets.keys() if s not in old_sheets
+                ]
+                with st.spinner("Computing differences…"):
+                    sheet_stats_g: Dict[str, dict] = {}
+                    sheet_data_g:  Dict[str, tuple] = {}
+                    for sname in common_g:
+                        oa, na, cs, rs, stats = compare_dataframes(
+                            old_sheets[sname], new_sheets[sname]
+                        )
+                        sheet_stats_g[sname] = stats
+                        sheet_data_g[sname]  = (oa, na, cs, rs)
 
-tabs = st.tabs(tab_labels)
+                if _fmt == "Side-by-Side":
+                    with st.spinner("Generating Tracked Pages (Side-by-Side)…"):
+                        tracked_bytes = build_sidebyside_excel(
+                            old_sheets, new_sheets, new_only_g, deleted_only_g,
+                            sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
+                            old_raw, new_raw,
+                        )
+                        tracked_fname = f"tracked_pages_sidebyside_{ts}.xlsx"
+                else:
+                    with st.spinner("Generating Tracked Pages (Inline Diff)…"):
+                        tracked_bytes = build_inline_excel(
+                            old_sheets, new_sheets, new_only_g, deleted_only_g,
+                            sheet_stats_g, sheet_data_g, old_file.name, new_file.name,
+                            old_raw, new_raw,
+                        )
+                        tracked_fname = f"tracked_pages_inline_{ts}.xlsx"
 
-for sname, tab in zip(ordered, tabs):
-    with tab:
-        if sname in new_only:
-            st.success(f"**'{sname}'** is a **new sheet** — it exists only in the Proposed Pages.")
-            df = new_sheets[sname]
-            st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
-            st.dataframe(df, use_container_width=True, height=380, hide_index=True)
+                with st.spinner("Building highlighted summary report…"):
+                    report_bytes = build_highlighted_excel(
+                        old_sheets, new_sheets, ordered_g, new_only_g, deleted_only_g,
+                        sheet_stats_g, old_file.name, new_file.name,
+                    )
+                    report_fname = f"excel_diff_{ts}.xlsx"
 
-        elif sname in deleted_only:
-            st.error(f"**'{sname}'** was **deleted** — it exists only in the Current Pages.")
-            df = old_sheets[sname]
-            st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
-            st.dataframe(df, use_container_width=True, height=380, hide_index=True)
-
-        else:
-            old_a, new_a, cell_status, row_status = sheet_data[sname]
-            sv = sheet_stats[sname]
-            has_chg = sv["changed_cells"] + sv["added_rows"] + sv["deleted_rows"] > 0
-
-            if not has_chg:
-                st.info(f"✅ No changes detected in **'{sname}'**.")
-                st.dataframe(new_sheets[sname], use_container_width=True, height=320, hide_index=True)
+                st.session_state.comp_data = {
+                    "old_sheets": old_sheets, "new_sheets": new_sheets,
+                    "ordered": ordered_g, "new_only": new_only_g,
+                    "deleted_only": deleted_only_g, "common": common_g,
+                    "sheet_stats": sheet_stats_g, "sheet_data": sheet_data_g,
+                    "old_name": old_file.name, "new_name": new_file.name,
+                    "report_bytes": report_bytes, "report_fname": report_fname,
+                }
+                st.session_state.tracked_report_bytes    = tracked_bytes
+                st.session_state.tracked_report_filename = tracked_fname
+                st.session_state.tracked_fmt             = _fmt
+                st.session_state.comp_file_ids           = _cur_fids
             else:
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Rows compared",  f"{sv['total_rows']:,}")
-                m2.metric("Added rows",     sv["added_rows"],
-                          delta=f"+{sv['added_rows']}" if sv["added_rows"] else None)
-                m3.metric("Deleted rows",   sv["deleted_rows"],
-                          delta=f"-{sv['deleted_rows']}" if sv["deleted_rows"] else None,
-                          delta_color="inverse")
-                m4.metric("Changed cells",  f"{sv['changed_cells']:,}")
-                st.markdown(
-                    """
-                    <div class="legend" style="margin-top:0.8rem">
-                      <div class="legend-item">
-                        <div class="legend-dot" style="background:#fffbeb;border:1.5px solid #f59e0b"></div>
-                        Changed cell &nbsp;(strikethrough = old value, green = new value)
-                      </div>
-                      <div class="legend-item">
-                        <div class="legend-dot" style="background:#ecfdf5;border:1.5px solid #10b981"></div>
-                        Added row
-                      </div>
-                      <div class="legend-item">
-                        <div class="legend-dot" style="background:#fef2f2;border:1.5px solid #ef4444"></div>
-                        Deleted row
-                      </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                st.error("Could not read one or both files. Please check they are valid Excel workbooks.")
+
+        # ── Render results ────────────────────────────────────────────────────
+        _cd = st.session_state.comp_data
+
+        if _cd is None:
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.info(
+                "Both files are ready. Choose a format and click "
+                "**⚙️ Generate Tracked Pages** to run the comparison.",
+                icon="ℹ️",
+            )
+        else:
+            # Unpack stored results
+            old_sheets   = _cd["old_sheets"];  new_sheets   = _cd["new_sheets"]
+            ordered      = _cd["ordered"];     new_only     = _cd["new_only"]
+            deleted_only = _cd["deleted_only"]; common       = _cd["common"]
+            sheet_stats  = _cd["sheet_stats"]; sheet_data   = _cd["sheet_data"]
+            old_names    = set(old_sheets);    new_names    = set(new_sheets)
+
+            total_changes = sum(
+                v["changed_cells"] + v["added_rows"] + v["deleted_rows"]
+                for v in sheet_stats.values()
+            )
+            modified_count = sum(
+                1 for v in sheet_stats.values()
+                if v["changed_cells"] + v["added_rows"] + v["deleted_rows"] > 0
+            )
+
+            # Summary metrics
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">📈 Comparison Summary</p>', unsafe_allow_html=True)
+            total_sheets_seen = len(old_names | new_names)
+            st.markdown(f"""
+            <div class="metric-grid">
+              <div class="metric-card"><div class="metric-value" style="color:#0f2942">{total_sheets_seen}</div><div class="metric-label">Total Sheets</div></div>
+              <div class="metric-card"><div class="metric-value" style="color:#10b981">{len(new_only)}</div><div class="metric-label">Added Sheets</div></div>
+              <div class="metric-card"><div class="metric-value" style="color:#ef4444">{len(deleted_only)}</div><div class="metric-label">Deleted Sheets</div></div>
+              <div class="metric-card"><div class="metric-value" style="color:#f59e0b">{modified_count}</div><div class="metric-label">Modified Sheets</div></div>
+              <div class="metric-card"><div class="metric-value" style="color:#6366f1">{len(common) - modified_count}</div><div class="metric-label">Unchanged Sheets</div></div>
+              <div class="metric-card"><div class="metric-value" style="color:#dc2626">{total_changes:,}</div><div class="metric-label">Total Changes</div></div>
+            </div>""", unsafe_allow_html=True)
+
+            # Sheet pills
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">📋 Sheet Overview</p>', unsafe_allow_html=True)
+            st.markdown("""<div class="legend">
+              <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div>New sheet</div>
+              <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div>Deleted sheet</div>
+              <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>Modified sheet</div>
+              <div class="legend-item"><div class="legend-dot" style="background:#c5cdd8"></div>Unchanged sheet</div>
+            </div>""", unsafe_allow_html=True)
+            pills_html = ['<div class="sheet-pills">']
+            for sname in ordered:
+                if sname in new_only:
+                    cls, icon = "pill pill-new", "＋"
+                elif sname in deleted_only:
+                    cls, icon = "pill pill-deleted", "−"
+                else:
+                    sv = sheet_stats.get(sname, {})
+                    has_chg = sv.get("changed_cells", 0) + sv.get("added_rows", 0) + sv.get("deleted_rows", 0) > 0
+                    cls  = "pill pill-modified" if has_chg else "pill pill-unchanged"
+                    icon = "~" if has_chg else "✓"
+                pills_html.append(f'<span class="{cls}">{_esc(f"{icon} {sname}")}</span>')
+            pills_html.append("</div>")
+            st.markdown("".join(pills_html), unsafe_allow_html=True)
+
+            # Per-sheet analysis
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">🔍 Sheet-by-Sheet Analysis</p>', unsafe_allow_html=True)
+            tab_labels: List[str] = []
+            for sname in ordered:
+                if sname in new_only:       tab_labels.append(f"🟢 {sname}")
+                elif sname in deleted_only: tab_labels.append(f"🔴 {sname}")
+                else:
+                    sv = sheet_stats.get(sname, {})
+                    has_chg = sv.get("changed_cells", 0) + sv.get("added_rows", 0) + sv.get("deleted_rows", 0) > 0
+                    tab_labels.append(f"🟡 {sname}" if has_chg else f"⚪ {sname}")
+            sheet_tabs = st.tabs(tab_labels)
+            for sname, stab in zip(ordered, sheet_tabs):
+                with stab:
+                    if sname in new_only:
+                        st.success(f"**'{sname}'** is a **new sheet** — exists only in Proposed Pages.")
+                        df = new_sheets[sname]
+                        st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
+                        st.dataframe(df, use_container_width=True, height=380, hide_index=True)
+                    elif sname in deleted_only:
+                        st.error(f"**'{sname}'** was **deleted** — exists only in Current Pages.")
+                        df = old_sheets[sname]
+                        st.caption(f"{len(df):,} rows × {len(df.columns):,} columns")
+                        st.dataframe(df, use_container_width=True, height=380, hide_index=True)
+                    else:
+                        old_a, new_a, cell_status, row_status = sheet_data[sname]
+                        sv = sheet_stats[sname]
+                        has_chg = sv["changed_cells"] + sv["added_rows"] + sv["deleted_rows"] > 0
+                        if not has_chg:
+                            st.info(f"✅ No changes detected in **'{sname}'**.")
+                            st.dataframe(new_sheets[sname], use_container_width=True, height=320, hide_index=True)
+                        else:
+                            m1, m2, m3, m4 = st.columns(4)
+                            m1.metric("Rows compared", f"{sv['total_rows']:,}")
+                            m2.metric("Added rows",    sv["added_rows"],    delta=f"+{sv['added_rows']}"    if sv["added_rows"]    else None)
+                            m3.metric("Deleted rows",  sv["deleted_rows"],  delta=f"-{sv['deleted_rows']}"  if sv["deleted_rows"]  else None, delta_color="inverse")
+                            m4.metric("Changed cells", f"{sv['changed_cells']:,}")
+                            st.markdown("""<div class="legend" style="margin-top:0.8rem">
+                              <div class="legend-item"><div class="legend-dot" style="background:#fffbeb;border:1.5px solid #f59e0b"></div>Changed cell</div>
+                              <div class="legend-item"><div class="legend-dot" style="background:#ecfdf5;border:1.5px solid #10b981"></div>Added row</div>
+                              <div class="legend-item"><div class="legend-dot" style="background:#fef2f2;border:1.5px solid #ef4444"></div>Deleted row</div>
+                            </div>""", unsafe_allow_html=True)
+                            st.markdown(render_diff_table(old_a, new_a, cell_status, row_status), unsafe_allow_html=True)
+
+            # Export
+            st.markdown('<hr class="divider">', unsafe_allow_html=True)
+            st.markdown('<p class="section-title">💾 Export</p>', unsafe_allow_html=True)
+            if st.session_state.tracked_report_bytes:
+                _tfmt = st.session_state.tracked_fmt or "Side-by-Side"
+                st.download_button(
+                    label="📋 Download Tracked Pages — Side-by-Side" if _tfmt == "Side-by-Side" else "🔀 Download Tracked Pages — Inline Diff",
+                    data=st.session_state.tracked_report_bytes,
+                    file_name=st.session_state.tracked_report_filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True, type="primary",
                 )
-                html = render_diff_table(old_a, new_a, cell_status, row_status)
-                st.markdown(html, unsafe_allow_html=True)
+            st.download_button(
+                label="📥 Download Highlighted Excel Report",
+                data=_cd["report_bytes"],
+                file_name=_cd["report_fname"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                help="Colour-coded sheet tabs and highlighted cells",
+            )
 
-# ── Export section ────────────────────────────────────────────────────────────
 
-st.markdown('<hr class="divider">', unsafe_allow_html=True)
-st.markdown('<p class="section-title">💾 Export</p>', unsafe_allow_html=True)
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — MASS PROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
 
-# Tracked Pages download (primary — generated by button)
-if st.session_state.tracked_report_bytes:
-    _tfmt   = st.session_state.tracked_fmt or "Side-by-Side"
-    _tlabel = (
-        "📋 Download Tracked Pages — Side-by-Side"
-        if _tfmt == "Side-by-Side"
-        else "🔀 Download Tracked Pages — Inline Diff"
+with _tab_mass:
+
+    # ── Upload rows ───────────────────────────────────────────────────────────
+    mass_col1, mass_col2 = st.columns(2)
+    with mass_col1:
+        st.markdown('<span class="upload-label">📂 Current Pages Folder</span>', unsafe_allow_html=True)
+        mass_cur_files = st.file_uploader(
+            "mass_current", type=["xlsx", "xls"], accept_multiple_files=True,
+            key="mass_cur", label_visibility="collapsed",
+            help="Select all Excel files from the Current Pages folder",
+        )
+    with mass_col2:
+        st.markdown('<span class="upload-label">📂 Proposed Pages Folder</span>', unsafe_allow_html=True)
+        mass_prop_files = st.file_uploader(
+            "mass_proposed", type=["xlsx", "xls"], accept_multiple_files=True,
+            key="mass_prop", label_visibility="collapsed",
+            help="Select all Excel files from the Proposed Pages folder",
+        )
+
+    # ── Format selector + Generate button ────────────────────────────────────
+    st.markdown(
+        '<p style="font-size:14px;font-weight:700;color:#0f2942;margin:0.9rem 0 0.3rem">'
+        '🔧 Tracked Pages format</p>',
+        unsafe_allow_html=True,
     )
-    st.download_button(
-        label=_tlabel,
-        data=st.session_state.tracked_report_bytes,
-        file_name=st.session_state.tracked_report_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-        type="primary",
-    )
+    mfmt_col, mbtn_col = st.columns([2, 1])
+    with mfmt_col:
+        st.radio(
+            "mass_format_selector",
+            options=["Side-by-Side", "Inline Diff"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="mass_export_fmt",
+            help=(
+                "Side-by-Side: Current Pages on the left, Proposed Pages on the right.\n"
+                "Inline Diff: single table — changed cells show ~~old~~  new in one cell."
+            ),
+        )
+    with mbtn_col:
+        _mass_generate = st.button(
+            "⚙️ Generate All Tracked Pages",
+            type="primary",
+            use_container_width=True,
+            key="mass_generate_btn",
+            disabled=not (mass_cur_files and mass_prop_files),
+            help="Upload files from both folders, then click to batch-generate all Tracked Pages",
+        )
 
-st.download_button(
-    label="📥 Download Highlighted Excel Report",
-    data=_cd["report_bytes"],
-    file_name=_cd["report_fname"],
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-    help="Excel workbook with colour-coded sheet tabs and highlighted cells",
-)
+    # ── Instructions ──────────────────────────────────────────────────────────
+    if not mass_cur_files or not mass_prop_files:
+        st.markdown(
+            """
+            <div class="info-box">
+              <strong>How to use — Mass Processing mode</strong>
+              <ol>
+                <li>Click <strong>Current Pages Folder</strong> and select <em>all</em> Excel files
+                    from your current pages folder (Ctrl+A or Cmd+A to select all).</li>
+                <li>Click <strong>Proposed Pages Folder</strong> and select <em>all</em> Excel files
+                    from your proposed pages folder.</li>
+                <li>Files are matched automatically by name — the only difference allowed is the
+                    <strong>date</strong> portion (format <code>DD-MM-YYYY</code> anywhere in the
+                    filename, e.g. <em>Report 01-11-2025 Final.xlsx</em> matches
+                    <em>Report 15-03-2026 Final.xlsx</em>).</li>
+                <li>Choose <strong>Side-by-Side</strong> or <strong>Inline Diff</strong>.</li>
+                <li>Click <strong>⚙️ Generate All Tracked Pages</strong> — a ZIP containing one
+                    Tracked Pages Excel per matched pair is produced for download.</li>
+              </ol>
+              <strong>Output file naming:</strong> each output file is named after the
+              Proposed Pages file with <em>" - TRACKED PAGES"</em> appended, e.g.
+              <em>Report 15-03-2026 Final - TRACKED PAGES.xlsx</em>.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        # Detect folder changes — clear stale mass results
+        _mass_cur_fid  = "|".join(sorted(f"{f.name}:{f.size}" for f in mass_cur_files))
+        _mass_prop_fid = "|".join(sorted(f"{f.name}:{f.size}" for f in mass_prop_files))
+        _mass_fids     = (_mass_cur_fid, _mass_prop_fid)
+        if st.session_state.mass_file_ids != _mass_fids:
+            st.session_state.mass_results   = None
+            st.session_state.mass_zip_bytes = None
+            st.session_state.mass_fmt       = None
+
+        # File matching preview (always shown once files are uploaded)
+        matched_pairs, unmatched_cur, unmatched_prop = _match_file_pairs(
+            mass_cur_files, mass_prop_files
+        )
+
+        preview_col1, preview_col2, preview_col3 = st.columns(3)
+        preview_col1.metric("Matched pairs",       len(matched_pairs))
+        preview_col2.metric("Unmatched — Current", len(unmatched_cur))
+        preview_col3.metric("Unmatched — Proposed",len(unmatched_prop))
+
+        if unmatched_cur or unmatched_prop:
+            with st.expander("⚠️ Unmatched files (will be skipped)"):
+                if unmatched_cur:
+                    st.markdown("**No match found in Proposed Pages:**")
+                    for f in unmatched_cur:
+                        st.markdown(f"&nbsp;&nbsp;• `{f.name}`")
+                if unmatched_prop:
+                    st.markdown("**No match found in Current Pages:**")
+                    for f in unmatched_prop:
+                        st.markdown(f"&nbsp;&nbsp;• `{f.name}`")
+
+        if not matched_pairs:
+            st.warning("No matching file pairs found. Check that filenames match (aside from the date portion).")
+        else:
+            # ── Generate on button click ──────────────────────────────────────
+            if _mass_generate:
+                _mfmt = st.session_state.get("mass_export_fmt", "Side-by-Side")
+                ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                mass_results_list = []
+                zip_buf = io.BytesIO()
+
+                progress_bar = st.progress(0, text="Starting…")
+                total_pairs  = len(matched_pairs)
+
+                with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for idx, (cur_f, prop_f) in enumerate(matched_pairs):
+                        progress_bar.progress(
+                            idx / total_pairs,
+                            text=f"Processing {idx + 1}/{total_pairs}: {prop_f.name}",
+                        )
+                        tracked_bytes, stats = _process_file_pair(cur_f, prop_f, _mfmt)
+                        mass_results_list.append(stats)
+                        if tracked_bytes:
+                            stem       = os.path.splitext(prop_f.name)[0]
+                            out_fname  = f"{stem} - TRACKED PAGES.xlsx"
+                            zf.writestr(out_fname, tracked_bytes)
+
+                progress_bar.progress(1.0, text=f"Done — {total_pairs} file(s) processed.")
+
+                st.session_state.mass_results   = mass_results_list
+                st.session_state.mass_zip_bytes = zip_buf.getvalue()
+                st.session_state.mass_fmt       = _mfmt
+                st.session_state.mass_file_ids  = _mass_fids
+
+            # ── Render mass results ───────────────────────────────────────────
+            _mr = st.session_state.mass_results
+
+            if _mr is None:
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+                st.info(
+                    f"**{len(matched_pairs)} pair(s)** ready. Choose a format and click "
+                    "**⚙️ Generate All Tracked Pages** to start batch processing.",
+                    icon="ℹ️",
+                )
+            else:
+                # ── Aggregate summary cards ───────────────────────────────────
+                ok_results  = [r for r in _mr if not r.get("error")]
+                err_results = [r for r in _mr if r.get("error")]
+
+                total_files_proc   = len(ok_results)
+                total_chg_across   = sum(r["total_changes"]   for r in ok_results)
+                total_cells_across = sum(r["changed_cells"]   for r in ok_results)
+                total_added_across = sum(r["added_rows"]      for r in ok_results)
+                total_del_across   = sum(r["deleted_rows"]    for r in ok_results)
+                files_with_changes = sum(1 for r in ok_results if r["total_changes"] > 0)
+                files_no_changes   = total_files_proc - files_with_changes
+
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+                st.markdown('<p class="section-title">📊 Mass Processing Summary</p>', unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class="metric-grid">
+                  <div class="metric-card"><div class="metric-value" style="color:#0f2942">{total_files_proc}</div><div class="metric-label">Files Processed</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#f59e0b">{files_with_changes}</div><div class="metric-label">Files With Changes</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#10b981">{files_no_changes}</div><div class="metric-label">Files Unchanged</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#dc2626">{total_chg_across:,}</div><div class="metric-label">Total Changes</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#6366f1">{total_cells_across:,}</div><div class="metric-label">Changed Cells</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#10b981">{total_added_across:,}</div><div class="metric-label">Added Rows</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#ef4444">{total_del_across:,}</div><div class="metric-label">Deleted Rows</div></div>
+                  <div class="metric-card"><div class="metric-value" style="color:#ef4444">{len(err_results)}</div><div class="metric-label">Errors</div></div>
+                </div>""", unsafe_allow_html=True)
+
+                # ── Per-file results table ────────────────────────────────────
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+                st.markdown('<p class="section-title">📋 Per-File Results</p>', unsafe_allow_html=True)
+
+                tbl_rows = []
+                for r in _mr:
+                    if r.get("error"):
+                        tbl_rows.append({
+                            "Current File":    r.get("current_file",  "—"),
+                            "Proposed File":   r.get("proposed_file", "—"),
+                            "Status":          f"❌ Error: {r['error']}",
+                            "Sheets":          "—", "New": "—", "Deleted": "—",
+                            "Modified": "—", "Changed Cells": "—",
+                            "Added Rows": "—", "Deleted Rows": "—",
+                        })
+                    else:
+                        status = "✅ No changes" if r["total_changes"] == 0 else f"🟡 {r['total_changes']:,} changes"
+                        tbl_rows.append({
+                            "Current File":  r["current_file"],
+                            "Proposed File": r["proposed_file"],
+                            "Status":        status,
+                            "Sheets":        r["total_sheets"],
+                            "New":           r["new_sheets"],
+                            "Deleted":       r["deleted_sheets"],
+                            "Modified":      r["modified_sheets"],
+                            "Changed Cells": r["changed_cells"],
+                            "Added Rows":    r["added_rows"],
+                            "Deleted Rows":  r["deleted_rows"],
+                        })
+
+                st.dataframe(
+                    pd.DataFrame(tbl_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(400, 60 + 38 * len(tbl_rows)),
+                )
+
+                if err_results:
+                    st.error(f"{len(err_results)} file(s) failed to process — see Status column above.")
+
+                # ── Download ZIP ──────────────────────────────────────────────
+                st.markdown('<hr class="divider">', unsafe_allow_html=True)
+                st.markdown('<p class="section-title">💾 Download</p>', unsafe_allow_html=True)
+                _mfmt_label = st.session_state.get("mass_fmt", "Side-by-Side")
+                st.download_button(
+                    label=f"📦 Download All Tracked Pages (ZIP) — {_mfmt_label}",
+                    data=st.session_state.mass_zip_bytes,
+                    file_name=f"tracked_pages_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary",
+                    help=f"ZIP containing one Tracked Pages Excel per matched file pair ({len(ok_results)} file(s))",
+                )
